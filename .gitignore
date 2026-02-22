@@ -227,3 +227,5 @@ Thumbs.db
 *.swp
 *.swo
 *~
+MoNuSAC
+mirror_dataset/
