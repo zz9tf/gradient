@@ -247,20 +247,6 @@ class GradAggregator:
         return (G @ Gpop) / (G_norm * Gpop_norm)
 
     @torch.no_grad()
-    def _pgrs_routing_keep(self, G: torch.Tensor, Gpop: torch.Tensor, tau: float):
-        """Routing: keep full g_t if rho_t>=tau else drop. returns (Gm [T,P], stats)."""
-        rho = self._rho(G, Gpop)
-        keep = (rho >= tau).float()
-        Gm = G * keep[:, None]
-        st = {
-            "rho_mean": rho.mean(),
-            "rho_min": rho.min(),
-            "rho_max": rho.max(),
-            "kept_frac": keep.mean(),
-        }
-        return Gm, st
-
-    @torch.no_grad()
     def _pgrs_projection_surgery(self, G: torch.Tensor, Gpop: torch.Tensor, tau: float):
         """
         Surgery (projection-based, 3-case):
@@ -379,16 +365,16 @@ class GradAggregator:
             # 2) compute lambda
             lam, conf, mean_g_norm = self._conf_lambda(G, Gpop)
 
-            # 3) routing branch (your EMA-based complex routing; currently hard-keep routing)
-            Grouting, st_route = self._pgrs_routing_keep(G, Gpop, tau=tau)
-            g_route = (w * Grouting).sum(dim=0)
+            # 3) projection surgery branch
+            Gprime, st_route = self._pgrs_projection_surgery(G, Gpop, tau=tau)
+            g_surgery = (w * Gprime).sum(dim=0)
 
             # 4) fallback branch: PCGrad
             Gpc = self._pcgrad(G)
             g_pc = (w * Gpc).sum(dim=0)
 
             # 5) mix on aggregated gradients (NOT per-task mix)
-            g_final = lam * g_route + (1.0 - lam) * g_pc
+            g_final = lam * g_surgery + (1.0 - lam) * g_pc
 
             stats.update(st_route)
             stats.update({
@@ -396,7 +382,7 @@ class GradAggregator:
                 "conf": conf.detach(),
                 "mean_g_norm": mean_g_norm.detach(),
                 "Gpop_norm": (Gpop.norm() + eps).detach(),
-                "cos_route_pc": torch.dot(g_route, g_pc) / ((g_route.norm()+eps) * (g_pc.norm()+eps)),
+                "cos_surgery_pc": torch.dot(g_surgery, g_pc) / ((g_surgery.norm()+eps) * (g_pc.norm()+eps)),
             })
 
         else:

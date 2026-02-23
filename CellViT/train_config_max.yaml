@@ -1,0 +1,101 @@
+# Single CellViT run for MoNuSAC (monusac_patched). Extend from configs/examples/cell_segmentation/train_cellvit.yaml.
+
+logging:
+  mode: offline
+  project: cellvit-monusac
+  notes: ""
+  log_comment: monusac_run
+  tags: []
+  wandb_dir: /home/zz/zheng/gradient/CellViT/logs
+  log_dir: /home/zz/zheng/gradient/CellViT/logs
+  level: info
+
+random_seed: 19
+gpu: 0
+
+data:
+  dataset: monusac_patched
+  dataset_path: /home/zz/zheng/gradient/hover_net/dataset/monusac
+  train_split: train
+  val_split: valid
+  patch_subdir: 256x256_164x164
+  num_nuclei_classes: 5
+  num_tissue_classes: 1
+  input_shape: 256
+
+model:
+  backbone: default
+  pretrained_encoder: null
+  pretrained: null
+  embed_dim: 384
+  input_channels: 3
+  depth: 12
+  num_heads: 6
+  extract_layers: [3, 6, 9, 12]
+  shared_decoders: false
+  regression_loss: false
+
+loss:
+  nuclei_binary_map:
+    bce:
+      loss_fn: xentropy_loss
+      weight: 1
+    dice:
+      loss_fn: dice_loss
+      weight: 1
+  hv_map:
+    mse:
+      loss_fn: mse_loss_maps
+      weight: 1
+    msge:
+      loss_fn: msge_loss_maps
+      weight: 1
+  nuclei_type_map:
+    bce:
+      loss_fn: xentropy_loss
+      weight: 1
+    dice:
+      loss_fn: dice_loss
+      weight: 1
+  # tissue_types:
+  #   ce:
+  #     loss_fn: CrossEntropyLoss
+  #     weight: 1
+
+training:
+  batch_size: 4
+  epochs: 130
+  unfreeze_epoch: 0
+  optimizer: AdamW
+  optimizer_hyperparameter:
+    lr: 0.0001
+    betas: [0.9, 0.999]
+    weight_decay: 0.01
+  early_stopping_patience: null
+  scheduler:
+    scheduler_type: cosine
+    eta_min: 1.0e-5
+  sampling_strategy: random
+  mixed_precision: false
+  eval_every: 1
+
+transformations:
+  randomrotate90:
+    p: 0.5
+  horizontalflip:
+    p: 0.5
+  verticalflip:
+    p: 0.5
+  normalize:
+    mean: [0.5, 0.5, 0.5]
+    std: [0.5, 0.5, 0.5]
+
+eval_checkpoint: model_best.pth
+
+# Optional: multi-task gradient aggregation (gradient_wrapper must be in parent dir).
+# Uncomment to enable (modes: sum, pcgrad, graddrop, pgrs, htdir).
+grad_wrapper:
+  mode: pgrs_lambda
+  tau: 0.2
+  beta: 0.999
+  eps: 1.0e-12

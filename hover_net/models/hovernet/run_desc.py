@@ -115,6 +115,10 @@ def train_step(batch_data, run_info):
         for key in ("fast_S", "fast_beta", "fast_e_norm", "fast_m_norm", "fast_v"):
             if key in grad_agg.last_stats:
                 track_value("pgrs/%s" % key, grad_agg.last_stats[key].item())
+        # pgrs_lambda specific: lambda, conf, mean_g_norm, Gpop_norm, cos_route_pc
+        for key in ("lambda", "conf", "mean_g_norm", "Gpop_norm", "cos_route_pc"):
+            if key in grad_agg.last_stats:
+                track_value("pgrs/%s" % key, grad_agg.last_stats[key].item())
 
     # (optional) ht_iters/ht_acc only exist for htdir mode
     if hasattr(grad_agg, "last_stats") and ("ht_iters" in grad_agg.last_stats):

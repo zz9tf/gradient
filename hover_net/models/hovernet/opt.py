@@ -60,7 +60,7 @@ def get_config(nr_type, mode):
                 },
                 "target_info": {"gen": (gen_targets, {}), "viz": (prep_sample, {})},
                 "batch_size": {"train": 4, "valid": 8,},  # engine name : value
-                "nr_epochs": 100,
+                "nr_epochs": 50,
             },
             {
                 "run_info": {
