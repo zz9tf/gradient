@@ -32,7 +32,7 @@ def get_config(nr_type, mode):
                     "net": {
                         "desc": lambda: create_model(
                             input_ch=3, nr_types=nr_type, 
-                            freeze=False, mode=mode
+                            freeze=True, mode=mode
                         ),
                         "optimizer": [
                             optim.Adam,
@@ -62,41 +62,41 @@ def get_config(nr_type, mode):
                 "batch_size": {"train": 4, "valid": 8,},  # engine name : value
                 "nr_epochs": 100,
             },
-            # {
-            #     "run_info": {
-            #         # may need more dynamic for each network
-            #         "net": {
-            #             "desc": lambda: create_model(
-            #                 input_ch=3, nr_types=nr_type, 
-            #                 freeze=False, mode=mode
-            #             ),
-            #             "optimizer": [
-            #                 optim.Adam,
-            #                 {  # should match keyword for parameters within the optimizer
-            #                     "lr": 1.0e-4,  # initial learning rate,
-            #                     "betas": (0.9, 0.999),
-            #                 },
-            #             ],
-            #             # learning rate scheduler
-            #             "lr_scheduler": lambda x: optim.lr_scheduler.StepLR(x, 25),
-            #             "extra_info": {
-            #                 "loss": {
-            #                     "np": {"bce": 1, "dice": 1},
-            #                     "hv": {"mse": 1, "msge": 1},
-            #                     "tp": {"bce": 1, "dice": 1},
-            #                 },
-            #                 "grad_mode": "sum",
-            #                 "grad_cfg": {},
-            #             },
-            #             # path to load, -1 to auto load checkpoint from previous phase,
-            #             # None to start from scratch
-            #             "pretrained": -1,
-            #         },
-            #     },
-            #     "target_info": {"gen": (gen_targets, {}), "viz": (prep_sample, {})},
-            #     "batch_size": {"train": 4, "valid": 8,}, # batch size per gpu
-            #     "nr_epochs": 50,
-            # },
+            {
+                "run_info": {
+                    # may need more dynamic for each network
+                    "net": {
+                        "desc": lambda: create_model(
+                            input_ch=3, nr_types=nr_type, 
+                            freeze=False, mode=mode
+                        ),
+                        "optimizer": [
+                            optim.Adam,
+                            {  # should match keyword for parameters within the optimizer
+                                "lr": 1.0e-4,  # initial learning rate,
+                                "betas": (0.9, 0.999),
+                            },
+                        ],
+                        # learning rate scheduler
+                        "lr_scheduler": lambda x: optim.lr_scheduler.StepLR(x, 25),
+                        "extra_info": {
+                            "loss": {
+                                "np": {"bce": 1, "dice": 1},
+                                "hv": {"mse": 1, "msge": 1},
+                                "tp": {"bce": 1, "dice": 1},
+                            },
+                            "grad_mode": "sum",
+                            "grad_cfg": {},
+                        },
+                        # path to load, -1 to auto load checkpoint from previous phase,
+                        # None to start from scratch
+                        "pretrained": -1,
+                    },
+                },
+                "target_info": {"gen": (gen_targets, {}), "viz": (prep_sample, {})},
+                "batch_size": {"train": 4, "valid": 8,}, # batch size per gpu
+                "nr_epochs": 50,
+            },
         ],
         # ------------------------------------------------------------------
         # TODO: dynamically for dataset plugin selection and processing also?
