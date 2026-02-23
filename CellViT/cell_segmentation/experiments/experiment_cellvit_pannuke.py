@@ -232,6 +232,7 @@ class ExperimentCellVitPanNuke(BaseExperiment):
             log_images=self.run_conf["logging"].get("log_images", False),
             magnification=self.run_conf["data"].get("magnification", 40),
             mixed_precision=self.run_conf["training"].get("mixed_precision", False),
+            grad_wrapper_config=self.run_conf.get("grad_wrapper"),
         )
 
         # Load checkpoint if provided

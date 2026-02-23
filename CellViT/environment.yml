@@ -9,6 +9,7 @@ dependencies:
   - pip=23.0=pyhd8ed1ab_0
   - python-javabridge
   - gcc
+  - openslide-python=1.2.0
 
   - pip:
     - mako==1.2.4
@@ -30,7 +31,6 @@ dependencies:
     - matplotlib==3.7.1
     - numpy>1.22,<1.24
     - opencv_python_headless==4.5.4.58
-    - openslide_python==1.2.0
     - pandarallel==1.6.5
     - pandas==1.5.3
     - Pillow==9.5.0

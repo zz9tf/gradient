@@ -7,7 +7,7 @@
 
 import logging
 from pathlib import Path
-from typing import Tuple, Union
+from typing import Dict, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -31,6 +31,22 @@ from cell_segmentation.utils.metrics import get_fast_pq, remap_label
 from cell_segmentation.utils.tools import cropping_center
 from models.segmentation.cell_segmentation.cellvit import CellViT
 from utils.tools import AverageMeter
+
+# Optional gradient wrapper for multi-task gradient aggregation (e.g. PGRS, PCGrad)
+_GRAD_WRAPPER_AVAILABLE = False
+_GradAggregator = None
+_GradAggConfig = None
+try:
+    import sys
+    _gradient_root = Path(__file__).resolve().parents[3]  # .../gradient
+    if _gradient_root.name == "gradient" and (_gradient_root / "gradient_wrapper").is_dir():
+        sys.path.insert(0, str(_gradient_root))
+    from gradient_wrapper.grad_wrapper import GradAggregator, GradAggConfig
+    _GRAD_WRAPPER_AVAILABLE = True
+    _GradAggregator = GradAggregator
+    _GradAggConfig = GradAggConfig
+except Exception:
+    pass
 
 
 class CellViTTrainer(BaseTrainer):
@@ -84,6 +100,7 @@ class CellViTTrainer(BaseTrainer):
         log_images: bool = False,
         magnification: int = 40,
         mixed_precision: bool = False,
+        grad_wrapper_config: Optional[dict] = None,
     ):
         super().__init__(
             model=model,
@@ -114,7 +131,19 @@ class CellViTTrainer(BaseTrainer):
                 self.loss_avg_tracker[f"{branch}_{loss_name}"] = AverageMeter(
                     f"{branch}_{loss_name}", ":.4f"
                 )
-        self.batch_avg_tissue_acc = AverageMeter("Batch_avg_tissue_ACC", ":4.f")
+        self.batch_avg_tissue_acc = AverageMeter("Batch_avg_tissue_ACC", ":.4f")
+        self._num_tissue_classes = len(self.tissue_types)
+
+        self.use_grad_wrapper = False
+        self.grad_aggregator = None
+        if grad_wrapper_config is not None and _GRAD_WRAPPER_AVAILABLE and _GradAggConfig is not None and _GradAggregator is not None:
+            cfg = _GradAggConfig(**{k: v for k, v in grad_wrapper_config.items() if k != "param_filter"})
+            param_filter = grad_wrapper_config.get("param_filter")
+            self.grad_aggregator = _GradAggregator(self.model, cfg, param_filter=param_filter, verbose=True)
+            self.use_grad_wrapper = True
+            self.logger.info("Gradient wrapper enabled: mode=%s", cfg.mode)
+        elif grad_wrapper_config is not None and not _GRAD_WRAPPER_AVAILABLE:
+            self.logger.warning("grad_wrapper_config set but gradient_wrapper not importable; training without it.")
 
     def train_epoch(
         self, epoch: int, train_dataloader: DataLoader, unfreeze_epoch: int = 50
@@ -172,13 +201,15 @@ class CellViTTrainer(BaseTrainer):
             )
             tissue_pred.append(batch_metrics["tissue_pred"])
             tissue_gt.append(batch_metrics["tissue_gt"])
-            train_loop.set_postfix(
-                {
-                    "Loss": np.round(self.loss_avg_tracker["Total_Loss"].avg, 3),
-                    "Dice": np.round(np.nanmean(binary_dice_scores), 3),
-                    "Pred-Acc": np.round(self.batch_avg_tissue_acc.avg, 3),
-                }
-            )
+            postfix = {
+                "Loss": np.round(self.loss_avg_tracker["Total_Loss"].avg, 3),
+                "Dice": np.round(np.nanmean(binary_dice_scores), 3),
+            }
+            if self._num_tissue_classes > 1:
+                postfix["Pred-Acc"] = np.round(self.batch_avg_tissue_acc.avg, 3)
+            else:
+                postfix["Pred-Acc"] = "N/A(1cls)"
+            train_loop.set_postfix(postfix)
 
         # calculate global metrics
         binary_dice_scores = np.array(binary_dice_scores)
@@ -263,12 +294,31 @@ class CellViTTrainer(BaseTrainer):
                     self.scaler.update()
                     self.optimizer.zero_grad(set_to_none=True)
                     self.model.zero_grad()
+        elif self.use_grad_wrapper:
+            # Gradient wrapper: per-branch losses -> aggregated backward (no AMP)
+            predictions_ = self.model.forward(imgs)
+            predictions = self.unpack_predictions(predictions=predictions_)
+            gt = self.unpack_masks(masks=masks, tissue_types=tissue_types)
+
+            branch_losses = self.get_per_branch_losses(predictions, gt)
+            if branch_losses:
+                self.grad_aggregator.backward(branch_losses)
+
+            if (
+                ((batch_idx + 1) % self.accum_iter == 0)
+                or ((batch_idx + 1) == num_batches)
+                or (self.accum_iter == 1)
+            ):
+                self.optimizer.step()
+                self.optimizer.zero_grad(set_to_none=True)
+                self.model.zero_grad()
+                with torch.cuda.device(self.device):
+                    torch.cuda.empty_cache()
         else:
             predictions_ = self.model.forward(imgs)
             predictions = self.unpack_predictions(predictions=predictions_)
             gt = self.unpack_masks(masks=masks, tissue_types=tissue_types)
 
-            # calculate loss
             total_loss = self.calculate_loss(predictions, gt)
 
             total_loss.backward()
@@ -354,13 +404,15 @@ class CellViTTrainer(BaseTrainer):
                 )
                 tissue_pred.append(batch_metrics["tissue_pred"])
                 tissue_gt.append(batch_metrics["tissue_gt"])
-                val_loop.set_postfix(
-                    {
-                        "Loss": np.round(self.loss_avg_tracker["Total_Loss"].avg, 3),
-                        "Dice": np.round(np.nanmean(binary_dice_scores), 3),
-                        "Pred-Acc": np.round(self.batch_avg_tissue_acc.avg, 3),
-                    }
-                )
+                postfix = {
+                    "Loss": np.round(self.loss_avg_tracker["Total_Loss"].avg, 3),
+                    "Dice": np.round(np.nanmean(binary_dice_scores), 3),
+                }
+                if self._num_tissue_classes > 1:
+                    postfix["Pred-Acc"] = np.round(self.batch_avg_tissue_acc.avg, 3)
+                else:
+                    postfix["Pred-Acc"] = "N/A(1cls)"
+                val_loop.set_postfix(postfix)
         tissue_types_val = [
             self.reverse_tissue_types[t].lower() for t in np.concatenate(tissue_gt)
         ]
@@ -653,6 +705,63 @@ class CellViTTrainer(BaseTrainer):
         self.loss_avg_tracker["Total_Loss"].update(total_loss.detach().cpu().numpy())
 
         return total_loss
+
+    def get_per_branch_losses(
+        self, predictions: DataclassHVStorage, gt: DataclassHVStorage
+    ) -> Dict[str, torch.Tensor]:
+        """Compute per-branch (per-task) losses for gradient wrapper aggregation.
+
+        Each branch yields one scalar (weighted sum of its loss terms). Used when
+        use_grad_wrapper is True so GradAggregator can aggregate gradients per task.
+
+        Args:
+            predictions: Model predictions.
+            gt: Ground-truth storage.
+
+        Returns:
+            Dict mapping branch name to scalar loss tensor (on same device as model).
+        """
+        predictions = predictions.get_dict()
+        gt = gt.get_dict()
+
+        branch_losses: Dict[str, torch.Tensor] = {}
+
+        for branch, pred in predictions.items():
+            if branch in [
+                "instance_map",
+                "instance_types",
+                "instance_types_nuclei",
+            ]:
+                continue
+            if branch not in self.loss_fn_dict:
+                continue
+            branch_loss_fns = self.loss_fn_dict[branch]
+            branch_total = None
+            for loss_name, loss_setting in branch_loss_fns.items():
+                loss_fn = loss_setting["loss_fn"]
+                weight = loss_setting["weight"]
+                if loss_name == "msge":
+                    loss_value = loss_fn(
+                        input=pred,
+                        target=gt[branch],
+                        focus=gt["nuclei_binary_map"],
+                        device=self.device,
+                    )
+                else:
+                    loss_value = loss_fn(input=pred, target=gt[branch])
+                weighted = weight * loss_value
+                branch_total = weighted if branch_total is None else branch_total + weighted
+                self.loss_avg_tracker[f"{branch}_{loss_name}"].update(
+                    loss_value.detach().cpu().numpy()
+                )
+            if branch_total is not None:
+                branch_losses[branch] = branch_total
+
+        if branch_losses:
+            total = sum(branch_losses.values())
+            self.loss_avg_tracker["Total_Loss"].update(total.detach().cpu().numpy())
+
+        return branch_losses
 
     def calculate_step_metric_train(
         self, predictions: DataclassHVStorage, gt: DataclassHVStorage

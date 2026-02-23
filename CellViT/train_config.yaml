@@ -6,8 +6,8 @@ logging:
   notes: ""
   log_comment: monusac_run
   tags: []
-  wandb_dir: /home/zz/zheng/gradient/CellViT/logs
-  log_dir: /home/zz/zheng/gradient/CellViT/logs
+  wandb_dir: /home/zheng/zheng/gradient/CellViT/logs
+  log_dir: /home/zheng/zheng/gradient/CellViT/logs
   level: info
 
 random_seed: 19
@@ -15,7 +15,7 @@ gpu: 0
 
 data:
   dataset: monusac_patched
-  dataset_path: /home/zz/zheng/gradient/hover_net/dataset
+  dataset_path: /home/zheng/zheng/gradient/hover_net/dataset/monusac
   train_split: train
   val_split: valid
   patch_subdir: 256x256_164x164
@@ -57,14 +57,14 @@ loss:
     dice:
       loss_fn: dice_loss
       weight: 1
-  tissue_types:
-    ce:
-      loss_fn: CrossEntropyLoss
-      weight: 1
+  # tissue_types:
+  #   ce:
+  #     loss_fn: CrossEntropyLoss
+  #     weight: 1
 
 training:
   batch_size: 4
-  epochs: 100
+  epochs: 130
   unfreeze_epoch: 0
   optimizer: AdamW
   optimizer_hyperparameter:
@@ -90,4 +90,12 @@ transformations:
     mean: [0.5, 0.5, 0.5]
     std: [0.5, 0.5, 0.5]
 
-eval_checkpoint: best_checkpoint.pth
+eval_checkpoint: model_best.pth
+
+# Optional: multi-task gradient aggregation (gradient_wrapper must be in parent dir).
+# Uncomment to enable (modes: sum, pcgrad, graddrop, pgrs, htdir).
+grad_wrapper:
+  mode: sum
+  # tau: 0.2
+  # beta: 0.999
+  # eps: 1.0e-12

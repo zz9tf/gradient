@@ -13,6 +13,11 @@ currentdir = os.path.dirname(os.path.abspath(inspect.getfile(inspect.currentfram
 parentdir = os.path.dirname(currentdir)
 sys.path.insert(0, parentdir)
 
+# Import torch and init CUDA before any other lib (e.g. wandb/TensorFlow) so PyTorch binds to the driver first and both GPUs are visible.
+import torch
+
+_ = torch.cuda.device_count()
+
 import wandb
 
 from base_ml.base_cli import ExperimentBaseParser
@@ -34,8 +39,6 @@ if __name__ == "__main__":
     # Parse arguments
     configuration_parser = ExperimentBaseParser()
     configuration = configuration_parser.parse_arguments()
-    print(configuration)
-    input()
 
     if configuration["data"]["dataset"].lower() == "pannuke":
         experiment_class = ExperimentCellVitPanNuke
