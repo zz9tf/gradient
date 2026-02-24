@@ -86,7 +86,16 @@ def train_step(batch_data, run_info):
         track_value(f"{branch_name}_loss", branch_loss.detach().item())
 
     optimizer.zero_grad(set_to_none=True)
-    stats = grad_agg.backward(loss_branch, weights=None)  # weights default = 1
+    # pgrs_lpf1 requires gpop_key (and optionally gpop_use_weight) from extra_info
+    extra = run_info["net"]["extra_info"]
+    gpop_key = extra.get("grad_gpop_key")
+    gpop_use_weight = extra.get("grad_gpop_use_weight", True)
+    stats = grad_agg.backward(
+        loss_branch,
+        weights=None,
+        gpop_key=gpop_key,
+        gpop_use_weight=gpop_use_weight,
+    )
     optimizer.step()
 
     track_value("overall_loss", total_loss.detach().item())   # 真实总loss（全参数）
@@ -99,26 +108,59 @@ def train_step(batch_data, run_info):
     if shrink is not None:
         track_value("shrink_ratio", shrink.item())
 
-    # (optional) kept_frac/rho_mean only exist for pgrs mode
-    if hasattr(grad_agg, "last_stats") and ("kept_frac" in grad_agg.last_stats):
-        track_value("pgrs/kept_frac", grad_agg.last_stats["kept_frac"].item())
-        track_value("pgrs/rho_mean",  grad_agg.last_stats["rho_mean"].item())
-        if "rho_min" in grad_agg.last_stats:
-            track_value("pgrs/rho_min", grad_agg.last_stats["rho_min"].item())
-        if "rho_max" in grad_agg.last_stats:
-            track_value("pgrs/rho_max", grad_agg.last_stats["rho_max"].item())
-        if "drop_frac" in grad_agg.last_stats:
-            track_value("pgrs/drop_frac", grad_agg.last_stats["drop_frac"].item())
-        if "surgery_frac" in grad_agg.last_stats:
-            track_value("pgrs/surgery_frac", grad_agg.last_stats["surgery_frac"].item())
+    # (optional) PGRS-family stats (pgrs, pgrs_lambda, pgrs_lpf1, pgrs_stage, pgrs_common_gate)
+    if hasattr(grad_agg, "last_stats") and grad_agg.last_stats:
+        ls = grad_agg.last_stats
+        # base pgrs metrics (if present)
+        if "kept_frac" in ls:
+            track_value("pgrs/kept_frac", ls["kept_frac"].item())
+        if "rho_mean" in ls:
+            track_value("pgrs/rho_mean",  ls["rho_mean"].item())
+        if "rho_min" in ls:
+            track_value("pgrs/rho_min",  ls["rho_min"].item())
+        if "rho_max" in ls:
+            track_value("pgrs/rho_max",  ls["rho_max"].item())
+        if "drop_frac" in ls:
+            track_value("pgrs/drop_frac", ls["drop_frac"].item())
+        if "surgery_frac" in ls:
+            track_value("pgrs/surgery_frac", ls["surgery_frac"].item())
         # fast-update stats (when use_fast_update=True)
         for key in ("fast_S", "fast_beta", "fast_e_norm", "fast_m_norm", "fast_v"):
-            if key in grad_agg.last_stats:
-                track_value("pgrs/%s" % key, grad_agg.last_stats[key].item())
+            if key in ls:
+                track_value(f"pgrs/{key}", ls[key].item())
         # pgrs_lambda specific: lambda, conf, mean_g_norm, Gpop_norm, cos_route_pc
         for key in ("lambda", "conf", "mean_g_norm", "Gpop_norm", "cos_route_pc"):
-            if key in grad_agg.last_stats:
-                track_value("pgrs/%s" % key, grad_agg.last_stats[key].item())
+            if key in ls:
+                track_value(f"pgrs/{key}", ls[key].item())
+        # pgrs_lpf1 specific: gpop_key_idx, lpf_in_norm, Gpop_norm
+        for key in ("gpop_key_idx", "lpf_in_norm", "Gpop_norm"):
+            if key in ls:
+                track_value(f"pgrs/{key}", ls[key].item())
+        # pgrs_stage specific flags
+        for key in ("late_stage", "loss_switch", "pgrs_stage_late_pcgrad"):
+            if key in ls:
+                track_value(f"pgrs_stage/{key}", ls[key].item())
+        # pgrs_common_gate specific: common-subspace alignment and gating stats
+        for key in (
+            "rho_c_mean",
+            "rho_c_min",
+            "rho_c_max",
+            "align_mean",
+            "align_min",
+            "align_neg_frac",
+            "rho_c_neg_frac",
+            "gpop_common_updated",
+            "Gpop_common_norm",
+            "common_frac_params",
+        ):
+            if key in ls:
+                track_value(f"pgrs_common_gate/{key}", ls[key].item())
+        # pgrs_common_gate correlations: corr_dloss_align/<branch>
+        for name, val in ls.items():
+            if name.startswith("corr_dloss_align/"):
+                # e.g. corr_dloss_align/np -> log as pgrs_common_gate/corr_dloss_align_np
+                suffix = name.split("/", 1)[1].replace("/", "_")
+                track_value(f"pgrs_common_gate/{suffix}", val.item())
 
     # (optional) ht_iters/ht_acc only exist for htdir mode
     if hasattr(grad_agg, "last_stats") and ("ht_iters" in grad_agg.last_stats):

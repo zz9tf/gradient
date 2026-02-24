@@ -3,8 +3,11 @@
 Main HoVer-Net training script.
 
 Usage:
-  run_train.py [--gpu=<id>] [--view=<dset>] [--grad-mode=<m>] [--grad-beta=<f>] [--grad-tau=<f>] [--grad-eps=<f>]
+  run_train.py [--gpu=<id>] [--view=<dset>] [--resume=<path>]
+    [--grad-mode=<m>] [--grad-beta=<f>] [--grad-tau=<f>] [--grad-eps=<f>]
+    [--grad-gpop-key=<key>] [--grad-gpop-use-weight=<0|1>]
     [--grad-dir-beta=<f>] [--grad-dir-k=<f>] [--grad-dir-reject-max=<n>]
+    [--grad-loss-switch=<f>]
   run_train.py (-h | --help)
   run_train.py --version
 
@@ -13,13 +16,17 @@ Options:
   --version               Show version.
   --gpu=<id>              Comma separated GPU list. [default: 0,1,2,3]
   --view=<dset>           Visualise images after augmentation. Choose 'train' or 'valid'.
-  --grad-mode=<m>         Gradient aggregation mode: sum|pcgrad|graddrop|pgrs|htdir (overrides config).
+  --resume=<path>         Resume training from this log dir (same grad overrides; set nr_epochs in opt to target total epochs).
+  --grad-mode=<m>         Gradient aggregation mode: sum|pcgrad|graddrop|pgrs|pgrs_lambda|pgrs_lpf1|pgrs_stage|pgrs_common_gate|htdir (overrides config).
   --grad-beta=<f>         PGRS EMA beta, e.g. 0.999 (overrides config).
   --grad-tau=<f>          PGRS alignment threshold, e.g. 0.2 (overrides config).
   --grad-eps=<f>          Epsilon for gradient aggregation (overrides config).
+  --grad-gpop-key=<key>   For pgrs_lpf1: loss key for LPF reference (e.g. np). Overrides config.
+  --grad-gpop-use-weight=<0|1>  For pgrs_lpf1: use weight for reference loss, 1=yes [default: 1].
   --grad-dir-beta=<f>     htdir concentration (>0), e.g. 5.0 (overrides config).
   --grad-dir-k=<f>        htdir tail heaviness (>0), e.g. 2.0 (overrides config).
   --grad-dir-reject-max=<n>  htdir max rejection steps, e.g. 64 (overrides config).
+  --grad-loss-switch=<f>  For pgrs_stage: loss threshold to switch to late stage (overrides config).
 """
 
 import cv2
@@ -93,7 +100,7 @@ def _parse_grad_overrides(args):
         args: dict from docopt (keys --grad-mode, --grad-beta, etc.).
 
     Returns:
-        dict: keys mode, beta, tau, eps, dir_beta, dir_k, dir_reject_max; only present if given on CLI.
+        dict: keys mode, beta, tau, eps, gpop_key, gpop_use_weight, dir_beta, dir_k, dir_reject_max, loss_switch; only present if given on CLI.
     """
     overrides = {}
     if args.get("--grad-mode"):
@@ -104,12 +111,18 @@ def _parse_grad_overrides(args):
         overrides["tau"] = float(args["--grad-tau"])
     if args.get("--grad-eps"):
         overrides["eps"] = float(args["--grad-eps"])
+    if args.get("--grad-gpop-key"):
+        overrides["gpop_key"] = args["--grad-gpop-key"]
+    if args.get("--grad-gpop-use-weight") is not None:
+        overrides["gpop_use_weight"] = bool(int(args["--grad-gpop-use-weight"]))
     if args.get("--grad-dir-beta"):
         overrides["dir_beta"] = float(args["--grad-dir-beta"])
     if args.get("--grad-dir-k"):
         overrides["dir_k"] = float(args["--grad-dir-k"])
     if args.get("--grad-dir-reject-max"):
         overrides["dir_reject_max"] = int(args["--grad-dir-reject-max"])
+    if args.get("--grad-loss-switch"):
+        overrides["loss_switch"] = float(args["--grad-loss-switch"])
     return overrides
 
 
@@ -118,10 +131,10 @@ def _grad_overrides_to_log_suffix(grad_overrides):
     Build a log subdir suffix from gradient overrides so results go to a different path.
 
     Args:
-        grad_overrides: dict with keys mode, beta, tau, eps, dir_beta, dir_k, dir_reject_max (any subset).
+        grad_overrides: dict with keys mode, beta, tau, eps, gpop_key, gpop_use_weight, dir_beta, dir_k, dir_reject_max, loss_switch (any subset).
 
     Returns:
-        str: e.g. "grad_pgrs" or "grad_htdir_db5_dk2", or "" if empty.
+        str: e.g. "grad_pgrs" or "grad_pgrs_lpf1_gknp", or "" if empty.
     """
     if not grad_overrides:
         return ""
@@ -132,12 +145,18 @@ def _grad_overrides_to_log_suffix(grad_overrides):
         parts.append("t%g" % grad_overrides["tau"])
     if "eps" in grad_overrides:
         parts.append("e%g" % grad_overrides["eps"])
+    if "gpop_key" in grad_overrides:
+        parts.append("gk%s" % grad_overrides["gpop_key"])
+    if "gpop_use_weight" in grad_overrides:
+        parts.append("gw%d" % int(grad_overrides["gpop_use_weight"]))
     if "dir_beta" in grad_overrides:
         parts.append("db%g" % grad_overrides["dir_beta"])
     if "dir_k" in grad_overrides:
         parts.append("dk%g" % grad_overrides["dir_k"])
     if "dir_reject_max" in grad_overrides:
         parts.append("dr%d" % grad_overrides["dir_reject_max"])
+    if "loss_switch" in grad_overrides:
+        parts.append("ls%g" % grad_overrides["loss_switch"])
     return "_".join(parts)
 
 
@@ -145,13 +164,16 @@ def _grad_overrides_to_log_suffix(grad_overrides):
 class TrainManager(Config):
     """Either used to view the dataset or to initialise the main training loop."""
 
-    def __init__(self, grad_overrides=None):
+    def __init__(self, grad_overrides=None, resume_path=None):
         """
         Args:
-            grad_overrides: Optional dict to override GradAggConfig (mode, beta, tau, eps, dir_beta, dir_k, dir_reject_max).
+            grad_overrides: Optional dict to override GradAggConfig
+                (mode, beta, tau, eps, dir_beta, dir_k, dir_reject_max, loss_switch).
+            resume_path: If set, resume training from this log dir (same grad overrides; set nr_epochs in opt to target total).
         """
         super().__init__()
         self.grad_overrides = grad_overrides or {}
+        self.resume_path = resume_path
         return
 
     ####
@@ -236,23 +258,45 @@ class TrainManager(Config):
         return dataloader
 
     ####
-    def run_once(self, opt, run_engine_opt, log_dir, prev_log_dir=None, fold_idx=0):
-        """Simply run the defined run_step of the related method once."""
+    def run_once(self, opt, run_engine_opt, log_dir, prev_log_dir=None, fold_idx=0, resume_log_dir=None):
+        """
+        Run one phase of training/validation.
+
+        Args:
+            opt: Phase option (run_info, target_info, batch_size, nr_epochs).
+            run_engine_opt: Engine config (train/valid callbacks etc.).
+            log_dir: Directory for checkpoints and stats.
+            prev_log_dir: Previous phase log dir (for pretrained=-1).
+            fold_idx: Fold index for dataloader.
+            resume_log_dir: If set and equals log_dir, resume from last checkpoint in log_dir
+                (restore model, optimizer, scheduler, grad_agg and continue from next epoch).
+                Set nr_epochs in opt to the desired total epoch count (e.g. 60 to add 20 more after 40).
+        """
         check_manual_seed(self.seed)
 
+        resume_mode = (
+            resume_log_dir is not None
+            and os.path.abspath(resume_log_dir) == os.path.abspath(log_dir)
+            and os.path.exists(os.path.join(log_dir, "stats.json"))
+        )
+        resume_start_epoch = 0
         log_info = {}
         if self.logging:
-            # check_log_dir(log_dir)
-            rm_n_mkdir(log_dir)
-
-            tfwriter = SummaryWriter(log_dir=log_dir)
-            json_log_file = log_dir + "/stats.json"
-            with open(json_log_file, "w") as json_file:
-                json.dump({}, json_file)  # create empty file
-            log_info = {
-                "json_file": json_log_file,
-                "tfwriter": tfwriter,
-            }
+            if resume_mode:
+                json_log_file = log_dir + "/stats.json"
+                with open(json_log_file) as json_file:
+                    stats = json.load(json_file)
+                resume_start_epoch = max(int(k) for k in stats.keys())
+                tfwriter = SummaryWriter(log_dir=log_dir)
+                log_info = {"json_file": json_log_file, "tfwriter": tfwriter}
+                print("[resume] Resuming from %s at epoch %d (will run until nr_epochs=%d)" % (log_dir, resume_start_epoch, opt["nr_epochs"]))
+            else:
+                rm_n_mkdir(log_dir)
+                tfwriter = SummaryWriter(log_dir=log_dir)
+                json_log_file = log_dir + "/stats.json"
+                with open(json_log_file, "w") as json_file:
+                    json.dump({}, json_file)
+                log_info = {"json_file": json_log_file, "tfwriter": tfwriter}
 
         ####
         loader_dict = {}
@@ -292,10 +336,21 @@ class TrainManager(Config):
             # summary_string(net_desc, (3, 270, 270), device='cpu')
 
             pretrained_path = net_info["pretrained"]
-            full_chkpt = None  # keep full .tar checkpoint to restore grad_agg later if present
-            if pretrained_path is not None:
+            full_chkpt = None  # full .tar for grad_agg / optimizer / scheduler restore
+            if resume_mode:
+                pretrained_path = get_last_chkpt_path(log_dir, net_name)
+                if not os.path.exists(pretrained_path):
+                    raise FileNotFoundError("Resume dir %s has no checkpoint for net %s (e.g. %s)" % (log_dir, net_name, pretrained_path))
+                full_chkpt = torch.load(pretrained_path)
+                net_state_dict = full_chkpt["desc"]
+                colored_word = colored(net_name, color="red", attrs=["bold"])
+                print("Model `%s` resume from: %s" % (colored_word, pretrained_path))
+                net_state_dict = convert_pytorch_checkpoint(net_state_dict)
+                load_feedback = net_desc.load_state_dict(net_state_dict, strict=False)
+                print("Missing Variables: \n", load_feedback[0])
+                print("Detected Unknown Variables: \n", load_feedback[1])
+            elif pretrained_path is not None:
                 if pretrained_path == -1:
-                    # * depend on logging format so may be broken if logging format has been changed
                     pretrained_path = get_last_chkpt_path(prev_log_dir, net_name)
                     full_chkpt = torch.load(pretrained_path)
                     net_state_dict = full_chkpt["desc"]
@@ -306,7 +361,7 @@ class TrainManager(Config):
                         net_state_dict = {
                             k: torch.from_numpy(v) for k, v in net_state_dict.items()
                         }
-                    elif chkpt_ext == "tar":  # ! assume same saving format we desire
+                    elif chkpt_ext == "tar":
                         full_chkpt = torch.load(pretrained_path)
                         net_state_dict = full_chkpt["desc"]
 
@@ -314,11 +369,8 @@ class TrainManager(Config):
                 print(
                     "Model `%s` pretrained path: %s" % (colored_word, pretrained_path)
                 )
-
-                # load_state_dict returns (missing keys, unexpected keys)
                 net_state_dict = convert_pytorch_checkpoint(net_state_dict)
                 load_feedback = net_desc.load_state_dict(net_state_dict, strict=False)
-                # * uncomment for your convenience
                 print("Missing Variables: \n", load_feedback[0])
                 print("Detected Unknown Variables: \n", load_feedback[1])
 
@@ -334,24 +386,46 @@ class TrainManager(Config):
             extra_info = dict(net_info["extra_info"])
             grad_mode = self.grad_overrides.get("mode", extra_info["grad_mode"])
             grad_cfg = {**extra_info["grad_cfg"]}
-            for k in ("beta", "tau", "eps", "dir_beta", "dir_k", "dir_reject_max"):
+            for k in ("beta", "tau", "eps", "dir_beta", "dir_k", "dir_reject_max", "loss_switch"):
                 if k in self.grad_overrides:
                     grad_cfg[k] = self.grad_overrides[k]
+            # pgrs_lpf1: gpop_key and gpop_use_weight (from config or CLI)
+            if "gpop_key" in self.grad_overrides:
+                extra_info["grad_gpop_key"] = self.grad_overrides["gpop_key"]
+            elif "grad_gpop_key" in extra_info:
+                pass  # keep from config
+            elif grad_mode == "pgrs_lpf1":
+                extra_info["grad_gpop_key"] = "np"  # default reference loss key
+            if "gpop_use_weight" in self.grad_overrides:
+                extra_info["grad_gpop_use_weight"] = self.grad_overrides["gpop_use_weight"]
+            elif "grad_gpop_use_weight" not in extra_info and grad_mode == "pgrs_lpf1":
+                extra_info["grad_gpop_use_weight"] = True
             # Store effective config so logs/checkpoints record what is actually used
             extra_info["grad_mode"] = grad_mode
             extra_info["grad_cfg"] = grad_cfg
-            def keeper(name, p):
+            # def keeper(name, p):
+            #     name = name[7:] if name.startswith("module.") else name
+            #     return not name.startswith("decoder.")
+            def common_param_filter(name, p):
                 name = name[7:] if name.startswith("module.") else name
                 return not name.startswith("decoder.")
             grad_agg = GradAggregator(
                 net_desc,
                 GradAggConfig(mode=grad_mode, **grad_cfg),
-                param_filter=keeper,
+                # param_filter=keeper,
+                common_param_filter=common_param_filter,
                 verbose=True,
             )
             if full_chkpt is not None and "grad_agg" in full_chkpt:
                 grad_agg.load_state_dict(full_chkpt["grad_agg"], strict=False)
                 print("[gradient] restored grad_agg state (Gpop) from checkpoint")
+            if resume_mode and full_chkpt is not None:
+                if "optimizer" in full_chkpt:
+                    optimizer.load_state_dict(full_chkpt["optimizer"])
+                    print("[resume] restored optimizer state")
+                if "lr_scheduler" in full_chkpt:
+                    scheduler.load_state_dict(full_chkpt["lr_scheduler"])
+                    print("[resume] restored lr_scheduler state")
             if self.grad_overrides:
                 print(
                     "[gradient] effective: mode=%s, grad_cfg=%s"
@@ -395,8 +469,13 @@ class TrainManager(Config):
         main_runner = runner_dict["train"]
         main_runner.state.logging = self.logging
         main_runner.state.log_dir = log_dir
-        # start the run loop
-        main_runner.run(opt["nr_epochs"])
+        start_epoch = resume_start_epoch if resume_mode else 0
+        if resume_mode and resume_start_epoch >= opt["nr_epochs"]:
+            raise ValueError(
+                "Resume start epoch (%d) >= nr_epochs (%d). Increase nr_epochs in opt (e.g. 60) to train more."
+                % (resume_start_epoch, opt["nr_epochs"])
+            )
+        main_runner.run(opt["nr_epochs"], start_epoch=start_epoch)
 
         print("\n")
         print("########################################################")
@@ -580,10 +659,14 @@ class TrainManager(Config):
 
         # When gradient CLI overrides are used, write results to a different subdir.
         base_log_dir = self.log_dir.rstrip("/")
-        grad_suffix = _grad_overrides_to_log_suffix(self.grad_overrides)
-        if grad_suffix:
-            base_log_dir = base_log_dir + "/" + grad_suffix
-            print("Gradient overrides active -> log dir: %s" % base_log_dir)
+        if self.resume_path:
+            base_log_dir = os.path.abspath(self.resume_path)
+            print("Resume -> log dir: %s" % base_log_dir)
+        else:
+            grad_suffix = _grad_overrides_to_log_suffix(self.grad_overrides)
+            if grad_suffix:
+                base_log_dir = base_log_dir + "/" + grad_suffix
+                print("Gradient overrides active -> log dir: %s" % base_log_dir)
 
         phase_list = self.model_config["phase_list"]
         engine_opt = self.model_config["run_engine"]
@@ -594,8 +677,10 @@ class TrainManager(Config):
                 save_path = base_log_dir
             else:
                 save_path = base_log_dir + "/%02d/" % (phase_idx)
+            resume_log_dir = self.resume_path if (phase_idx == 0 and self.resume_path) else None
             self.run_once(
-                phase_info, engine_opt, save_path, prev_log_dir=prev_save_path
+                phase_info, engine_opt, save_path, prev_log_dir=prev_save_path,
+                resume_log_dir=resume_log_dir,
             )
             prev_save_path = save_path
         
@@ -610,7 +695,8 @@ if __name__ == "__main__":
     grad_overrides = _parse_grad_overrides(args)
     if grad_overrides:
         print("Gradient CLI overrides:", grad_overrides)
-    trainer = TrainManager(grad_overrides=grad_overrides)
+    resume_path = args.get("--resume") or None
+    trainer = TrainManager(grad_overrides=grad_overrides, resume_path=resume_path)
 
     if args["--view"]:
         if args["--view"] != "train" and args["--view"] != "valid":

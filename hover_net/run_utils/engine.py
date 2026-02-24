@@ -129,11 +129,21 @@ class RunEngine(object):
         self.event_handler_dict[event_name].append(handler)
 
     # ! Put into trainer.py ?
-    def run(self, nr_epoch=1, shared_state=None, chained=False):
+    def run(self, nr_epoch=1, shared_state=None, chained=False, start_epoch=0):
+        """
+        Run the engine for epochs [start_epoch, nr_epoch).
 
+        Args:
+            nr_epoch: Upper bound of epochs (exclusive).
+            shared_state: Shared state when chained.
+            chained: If True, curr_epoch is reset to 0 (for valid after train).
+            start_epoch: Epoch index to start from (for resume). Must be < nr_epoch.
+        """
         # TODO: refactor this
         if chained:
             self.state.curr_epoch = 0
+        else:
+            self.state.curr_epoch = start_epoch
         self.state.global_state = shared_state
 
         while self.state.curr_epoch < nr_epoch:
