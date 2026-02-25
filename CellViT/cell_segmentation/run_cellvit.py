@@ -40,6 +40,16 @@ if __name__ == "__main__":
     configuration_parser = ExperimentBaseParser()
     configuration = configuration_parser.parse_arguments()
 
+    # Optional: print gradient wrapper strategy configuration for easier debugging
+    grad_wrapper_cfg = configuration.get("grad_wrapper")
+    if grad_wrapper_cfg is not None:
+        # keep this simple and explicit so logs clearly show which strategy was used
+        print(
+            "[GradWrapper] Enabled with configuration:",
+            {k: v for k, v in grad_wrapper_cfg.items()},
+            flush=True,
+        )
+
     if configuration["data"]["dataset"].lower() == "pannuke":
         experiment_class = ExperimentCellVitPanNuke
     elif configuration["data"]["dataset"].lower() == "conic":

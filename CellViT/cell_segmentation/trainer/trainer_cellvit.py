@@ -49,6 +49,51 @@ except Exception:
     pass
 
 
+def _print_model_param_blocks(model: torch.nn.Module) -> None:
+    """Print all trainable parameters grouped by top-level block (first name segment).
+
+    Use this to decide which prefixes are 'common' (e.g. encoder, shared decoders)
+    vs 'private' (task-specific heads) for GradAggregator.common_param_filter.
+    """
+    from collections import defaultdict
+    blocks = defaultdict(list)
+    for n, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        top = n.split(".", 1)[0]
+        blocks[top].append(n)
+    print("[GradWrapper] Model parameter blocks (top-level names):")
+    for block_name in sorted(blocks.keys()):
+        names = blocks[block_name]
+        print(f"  {block_name}: {len(names)} params, e.g. {names[0]}")
+    print()
+
+
+def _make_common_param_filter(common_prefixes: Tuple[str, ...]):
+    """Build common_param_filter callable for GradAggregator.
+
+    Args:
+        common_prefixes: Parameter name prefixes that belong to the common (shared) part.
+            E.g. ("encoder.", "decoder0.", "decoder1.", "decoder2.", "decoder3.") for CellViT.
+
+    Returns:
+        Callable (name: str, param: torch.Tensor) -> bool; True = common.
+    """
+    def _filter(name: str, param: torch.nn.Parameter) -> bool:
+        return any(name.startswith(p) for p in common_prefixes)
+    return _filter
+
+
+# Default common (shared) blocks for CellViT: encoder + shared decoders; branch decoders are private.
+_CELLVIT_DEFAULT_COMMON_PREFIXES = (
+    "encoder.",
+    "decoder0.",
+    "decoder1.",
+    "decoder2.",
+    "decoder3.",
+)
+
+
 class CellViTTrainer(BaseTrainer):
     """CellViT trainer class
 
@@ -136,14 +181,48 @@ class CellViTTrainer(BaseTrainer):
 
         self.use_grad_wrapper = False
         self.grad_aggregator = None
-        if grad_wrapper_config is not None and _GRAD_WRAPPER_AVAILABLE and _GradAggConfig is not None and _GradAggregator is not None:
-            cfg = _GradAggConfig(**{k: v for k, v in grad_wrapper_config.items() if k != "param_filter"})
+        self.grad_wrapper_config = grad_wrapper_config
+        if (
+            grad_wrapper_config is not None
+            and _GRAD_WRAPPER_AVAILABLE
+            and _GradAggConfig is not None
+            and _GradAggregator is not None
+        ):
+            cfg_kwargs = {k: v for k, v in grad_wrapper_config.items()
+                          if k not in ("param_filter", "common_param_filter", "common_prefixes")}
+            cfg = _GradAggConfig(**cfg_kwargs)
             param_filter = grad_wrapper_config.get("param_filter")
-            self.grad_aggregator = _GradAggregator(self.model, cfg, param_filter=param_filter, verbose=True)
+
+            # Print all parameter blocks so you can see what is common vs private
+            _print_model_param_blocks(self.model)
+
+            # Common (shared) params: from config or CellViT default (encoder + decoder0..3)
+            common_param_filter = grad_wrapper_config.get("common_param_filter")
+            if common_param_filter is None:
+                prefixes = grad_wrapper_config.get("common_prefixes", _CELLVIT_DEFAULT_COMMON_PREFIXES)
+                if isinstance(prefixes, list):
+                    prefixes = tuple(prefixes)
+                common_param_filter = _make_common_param_filter(prefixes)
+                self.logger.info("GradWrapper using default common_prefixes: %s", prefixes)
+
+            self.grad_aggregator = _GradAggregator(
+                self.model,
+                cfg,
+                param_filter=param_filter,
+                common_param_filter=common_param_filter,
+                verbose=True,
+            )
             self.use_grad_wrapper = True
-            self.logger.info("Gradient wrapper enabled: mode=%s", cfg.mode)
+            # log full gradient strategy configuration so experiments are fully reproducible
+            self.logger.info(
+                "Gradient wrapper enabled with mode=%s and config=%s",
+                cfg.mode,
+                cfg_kwargs,
+            )
         elif grad_wrapper_config is not None and not _GRAD_WRAPPER_AVAILABLE:
-            self.logger.warning("grad_wrapper_config set but gradient_wrapper not importable; training without it.")
+            self.logger.warning(
+                "grad_wrapper_config set but gradient_wrapper not importable; training without it."
+            )
 
     def train_epoch(
         self, epoch: int, train_dataloader: DataLoader, unfreeze_epoch: int = 50
@@ -167,6 +246,7 @@ class CellViTTrainer(BaseTrainer):
         binary_jaccard_scores = []
         tissue_pred = []
         tissue_gt = []
+        grad_agg_stats_list = []
         train_example_img = None
 
         # reset metrics
@@ -201,6 +281,8 @@ class CellViTTrainer(BaseTrainer):
             )
             tissue_pred.append(batch_metrics["tissue_pred"])
             tissue_gt.append(batch_metrics["tissue_gt"])
+            if batch_metrics.get("grad_agg_stats"):
+                grad_agg_stats_list.append(batch_metrics["grad_agg_stats"])
             postfix = {
                 "Loss": np.round(self.loss_avg_tracker["Total_Loss"].avg, 3),
                 "Dice": np.round(np.nanmean(binary_dice_scores), 3),
@@ -231,13 +313,29 @@ class CellViTTrainer(BaseTrainer):
                     f"{branch}_{loss_name}"
                 ].avg
 
-        self.logger.info(
-            f"{'Training epoch stats:' : <25} "
-            f"Loss: {self.loss_avg_tracker['Total_Loss'].avg:.4f} - "
-            f"Binary-Cell-Dice: {np.nanmean(binary_dice_scores):.4f} - "
-            f"Binary-Cell-Jacard: {np.nanmean(binary_jaccard_scores):.4f} - "
-            f"Tissue-MC-Acc.: {tissue_detection_accuracy:.4f}"
-        )
+        # Gradient wrapper stats (EMA, ratio, PGRS, etc.) when available
+        if grad_agg_stats_list:
+            grad_agg_mean = {}
+            for key in grad_agg_stats_list[0]:
+                vals = [d[key] for d in grad_agg_stats_list if key in d]
+                if vals:
+                    grad_agg_mean[key] = np.mean(vals)
+            for key, val in grad_agg_mean.items():
+                scalar_metrics[f"GradAgg/{key}/Train"] = val
+            grad_agg_str = " - ".join(f"{k}: {v:.4f}" for k, v in sorted(grad_agg_mean.items()))
+        else:
+            grad_agg_str = None
+
+        log_parts = [
+            f"{'Training epoch stats:' : <25} ",
+            f"Loss: {self.loss_avg_tracker['Total_Loss'].avg:.4f} - ",
+            f"Binary-Cell-Dice: {np.nanmean(binary_dice_scores):.4f} - ",
+            f"Binary-Cell-Jacard: {np.nanmean(binary_jaccard_scores):.4f} - ",
+            f"Tissue-MC-Acc.: {tissue_detection_accuracy:.4f}",
+        ]
+        if grad_agg_str:
+            log_parts.append(f" | GradAgg: {grad_agg_str}")
+        self.logger.info("".join(log_parts))
 
         image_metrics = {"Example-Predictions/Train": train_example_img}
 
@@ -270,6 +368,7 @@ class CellViTTrainer(BaseTrainer):
         ]  # dict: keys: "instance_map", "nuclei_map", "nuclei_binary_map", "hv_map"
         tissue_types = batch[2]  # list[str]
 
+        grad_agg_stats = None
         if self.mixed_precision:
             with torch.autocast(device_type="cuda", dtype=torch.float16):
                 # make predictions
@@ -302,7 +401,12 @@ class CellViTTrainer(BaseTrainer):
 
             branch_losses = self.get_per_branch_losses(predictions, gt)
             if branch_losses:
-                self.grad_aggregator.backward(branch_losses)
+                stats = self.grad_aggregator.backward(branch_losses)
+                if stats:
+                    grad_agg_stats = {
+                        k: v.item() if torch.is_tensor(v) else float(v)
+                        for k, v in stats.items()
+                    }
 
             if (
                 ((batch_idx + 1) % self.accum_iter == 0)
@@ -334,6 +438,8 @@ class CellViTTrainer(BaseTrainer):
                     torch.cuda.empty_cache()
 
         batch_metrics = self.calculate_step_metric_train(predictions, gt)
+        if grad_agg_stats is not None:
+            batch_metrics["grad_agg_stats"] = grad_agg_stats
 
         if return_example_images:
             return_example_images = self.generate_example_image(

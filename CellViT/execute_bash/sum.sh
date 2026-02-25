@@ -7,4 +7,4 @@ cd /home/zheng/zheng/gradient/CellViT
 
 cuda_device=0
 
-python cell_segmentation/run_cellvit.py --config train_config.yaml --gpu $cuda_device
+python cell_segmentation/run_cellvit.py --config execute_bash/train_config_sum.yaml --gpu $cuda_device
