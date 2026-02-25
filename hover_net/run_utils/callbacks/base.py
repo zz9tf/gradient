@@ -165,9 +165,8 @@ class AccumulateRawOutput(BaseCallbacks):
                 accumulated_output[key].extend(list(step_value))
             else:
                 accumulated_output[key] = list(step_value)
-        print("base.py: AccumulateRawOutput")
-        print(len(accumulated_output))
-        print(len(step_output))
+        for k in sorted(accumulated_output.keys()):
+            print(k, len(accumulated_output[k]))
         return
 
 

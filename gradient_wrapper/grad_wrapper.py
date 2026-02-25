@@ -625,8 +625,7 @@ class GradAggregator:
                 g_final[cmask] = 0.0
 
             # gated update of Gpop_common (use RAW common grad to avoid self-locking)
-            if can_update.item():
-                self._update_gpop_common(g_raw_c)
+            self._update_gpop_common(g_raw_c)
                 
             beta = getattr(self, "corr_beta", 0.99)
             for i, k in enumerate(names):
