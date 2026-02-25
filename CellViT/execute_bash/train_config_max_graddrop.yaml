@@ -95,7 +95,4 @@ eval_checkpoint: model_best.pth
 # Optional: multi-task gradient aggregation (gradient_wrapper must be in parent dir).
 # Uncomment to enable (modes: sum, pcgrad, graddrop, pgrs, htdir).
 grad_wrapper:
-  mode: pgrs_lambda
-  tau: 0.2
-  beta: 0.999
-  eps: 1.0e-12
+  mode: graddrop

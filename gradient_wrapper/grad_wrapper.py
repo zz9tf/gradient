@@ -52,7 +52,7 @@ def gradvec(loss: torch.Tensor, params: List[torch.nn.Parameter], retain_graph: 
 
 @dataclass
 class GradAggConfig:
-    mode: str = "pgrs"   # sum | pcgrad | graddrop | pgrs | pgrs_lambda | htdir | pgrs_keep1 | pgrs_stage | pgrs_lpf1 | pgrs_common_gate
+    mode: str = "pgrs"   # sum | pcgrad | graddrop | pgrs | pgrs_lambda | htdir | pgrs_stage | pgrs_lpf1 | pgrs_common_gate
     eps: float = 1e-12
 
     # PGRS
