@@ -7,7 +7,7 @@ Usage:
     [--grad-mode=<m>] [--grad-beta=<f>] [--grad-tau=<f>] [--grad-eps=<f>]
     [--grad-gpop-key=<key>] [--grad-gpop-use-weight=<0|1>]
     [--grad-dir-beta=<f>] [--grad-dir-k=<f>] [--grad-dir-reject-max=<n>]
-    [--grad-loss-switch=<f>]
+    [--grad-loss-switch=<f>] [--grad-common-gate-rho-thr=<f>]
   run_train.py (-h | --help)
   run_train.py --version
 
@@ -27,6 +27,7 @@ Options:
   --grad-dir-k=<f>        htdir tail heaviness (>0), e.g. 2.0 (overrides config).
   --grad-dir-reject-max=<n>  htdir max rejection steps, e.g. 64 (overrides config).
   --grad-loss-switch=<f>  For pgrs_stage: loss threshold to switch to late stage (overrides config).
+  --grad-common-gate-rho-thr=<f>  For pgrs_common_gate: rho gate threshold in [-1,1] (overrides config).
 """
 
 import cv2
@@ -100,7 +101,7 @@ def _parse_grad_overrides(args):
         args: dict from docopt (keys --grad-mode, --grad-beta, etc.).
 
     Returns:
-        dict: keys mode, beta, tau, eps, gpop_key, gpop_use_weight, dir_beta, dir_k, dir_reject_max, loss_switch; only present if given on CLI.
+        dict: keys mode, beta, tau, eps, gpop_key, gpop_use_weight, dir_beta, dir_k, dir_reject_max, loss_switch, common_gate_rho_thr; only present if given on CLI.
     """
     overrides = {}
     if args.get("--grad-mode"):
@@ -123,6 +124,8 @@ def _parse_grad_overrides(args):
         overrides["dir_reject_max"] = int(args["--grad-dir-reject-max"])
     if args.get("--grad-loss-switch"):
         overrides["loss_switch"] = float(args["--grad-loss-switch"])
+    if args.get("--grad-common-gate-rho-thr"):
+        overrides["common_gate_rho_thr"] = float(args["--grad-common-gate-rho-thr"])
     return overrides
 
 
@@ -131,7 +134,7 @@ def _grad_overrides_to_log_suffix(grad_overrides):
     Build a log subdir suffix from gradient overrides so results go to a different path.
 
     Args:
-        grad_overrides: dict with keys mode, beta, tau, eps, gpop_key, gpop_use_weight, dir_beta, dir_k, dir_reject_max, loss_switch (any subset).
+        grad_overrides: dict with keys mode, beta, tau, eps, gpop_key, gpop_use_weight, dir_beta, dir_k, dir_reject_max, loss_switch, common_gate_rho_thr (any subset).
 
     Returns:
         str: e.g. "grad_pgrs" or "grad_pgrs_lpf1_gknp", or "" if empty.
@@ -157,6 +160,8 @@ def _grad_overrides_to_log_suffix(grad_overrides):
         parts.append("dr%d" % grad_overrides["dir_reject_max"])
     if "loss_switch" in grad_overrides:
         parts.append("ls%g" % grad_overrides["loss_switch"])
+    if "common_gate_rho_thr" in grad_overrides:
+        parts.append("cgr%g" % grad_overrides["common_gate_rho_thr"])
     return "_".join(parts)
 
 
@@ -168,7 +173,7 @@ class TrainManager(Config):
         """
         Args:
             grad_overrides: Optional dict to override GradAggConfig
-                (mode, beta, tau, eps, dir_beta, dir_k, dir_reject_max, loss_switch).
+                (mode, beta, tau, eps, dir_beta, dir_k, dir_reject_max, loss_switch, common_gate_rho_thr).
             resume_path: If set, resume training from this log dir (same grad overrides; set nr_epochs in opt to target total).
         """
         super().__init__()
@@ -386,7 +391,7 @@ class TrainManager(Config):
             extra_info = dict(net_info["extra_info"])
             grad_mode = self.grad_overrides.get("mode", extra_info["grad_mode"])
             grad_cfg = {**extra_info["grad_cfg"]}
-            for k in ("beta", "tau", "eps", "dir_beta", "dir_k", "dir_reject_max", "loss_switch"):
+            for k in ("beta", "tau", "eps", "dir_beta", "dir_k", "dir_reject_max", "loss_switch", "common_gate_rho_thr"):
                 if k in self.grad_overrides:
                     grad_cfg[k] = self.grad_overrides[k]
             # pgrs_lpf1: gpop_key and gpop_use_weight (from config or CLI)

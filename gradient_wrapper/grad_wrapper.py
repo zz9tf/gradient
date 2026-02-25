@@ -53,7 +53,7 @@ def gradvec(loss: torch.Tensor, params: List[torch.nn.Parameter], retain_graph: 
 @dataclass
 class GradAggConfig:
     mode: str = "pgrs"   # sum | pcgrad | graddrop | pgrs | pgrs_lambda | htdir | pgrs_stage | pgrs_lpf1 | pgrs_common_gate
-    eps: float = 1e-12
+    eps: float = 1e-8
 
     # PGRS
     beta: float = 0.999
@@ -65,6 +65,8 @@ class GradAggConfig:
     dir_reject_max: int = 64
     # --- NEW: stage switch ---
     loss_switch: float = 10.0   # overall_loss_raw < loss_switch => late-stage
+    
+    common_gate_rho_thr: float = 0.0
 
     def validate(self):
         m = self.mode.lower()
@@ -80,7 +82,12 @@ class GradAggConfig:
                 raise ValueError(f"[htdir] dir_beta must be > 0, got {self.dir_beta}")
             if self.dir_k <= 0:
                 raise ValueError(f"[htdir] dir_k must be > 0, got {self.dir_k}")
-
+        if m == "pgrs_common_gate":
+            thr = float(self.common_gate_rho_thr)
+            if not (-1.0 <= thr <= 1.0):
+                raise ValueError(
+                    f"[pgrs_common_gate] common_gate_rho_thr must be in [-1,1], got {thr}"
+                )
 
 # ----------------------------- aggregator -----------------------------
 
@@ -409,7 +416,10 @@ class GradAggregator:
 
         # per-task gradients (global space)
         w_list = [float(weights.get(k, 1.0)) for k in names]
-        g_list = [gradvec(losses[k], self.params, retain_graph=True) for k in names]
+        g_list = []
+        for i,k in enumerate(names):
+            rg = (i != len(names)-1)
+            g_list.append(gradvec(losses[k], self.params, retain_graph=rg))
         G = torch.stack(g_list, dim=0)  # [T, P]
         w = torch.tensor(w_list, device=device, dtype=G.dtype).view(T, 1)
         g_raw = (w * G).sum(dim=0)      # [P]
@@ -434,7 +444,7 @@ class GradAggregator:
             tau = float(self.cfg.tau)
             # initialize Gpop if not initialized
             if self.Gpop is None:
-                self.Gpop = g_raw
+                self.Gpop = g_raw.detach().clone()
             Gprime, st = self._pgrs_projection_surgery(G, self.Gpop, tau=tau)
             g_final = (w * Gprime).sum(dim=0)
             self._update_gpop(g_final)
@@ -596,10 +606,15 @@ class GradAggregator:
             rho_c = self._rho(Gc, self.Gpop_common)  # [T]
             # alignment signal (dot, not cosine)
             align = (Gc @ self.Gpop_common).detach()  # [T]
-            can_update = (rho_c.min() >= 0)          # strict: any negative -> freeze
+            rho_thr = g_raw_c.new_tensor(float(self.cfg.common_gate_rho_thr))
+            # thr = g_raw_c.new_tensor(1e-12)
+            # can_update = (rho_c.min() >= rho_thr) & (g_raw_c.norm() > thr)
+            can_update = (rho_c.min() >= rho_thr)
 
             # parameter update uses raw full gradient (no surgery)
-            g_final = g_raw
+            g_final = g_raw.clone()
+            if not can_update.item():
+                g_final[cmask] = 0.0
 
             # gated update of Gpop_common (use RAW common grad to avoid self-locking)
             if can_update.item():
@@ -618,6 +633,31 @@ class GradAggregator:
                 # corr(Δloss, align)
                 ci = self._ema_corr_update(f"dloss_align/{k}", dli, align[i], beta=beta, eps=eps)
                 stats[f"corr_dloss_align/{k}"] = ci.detach()
+            
+            # ---- NEW: pairwise cosine between task grads in COMMON subspace ----
+            Gc_norm = Gc.norm(dim=1) + eps                     # [T]
+            Gc_unit = Gc / Gc_norm[:, None]                    # [T, Pc]
+            cos_tt = Gc_unit @ Gc_unit.T                       # [T, T]  pairwise cosine
+
+            # take upper triangle (exclude diagonal) for summary stats
+            triu = torch.triu(torch.ones_like(cos_tt, dtype=torch.bool), diagonal=1)
+            cos_vals = cos_tt[triu]                            # [T*(T-1)/2]
+
+            # conflict fraction: negative cosine among task pairs
+            stats.update({
+                "cos_tt_mean": cos_vals.mean().detach() if cos_vals.numel() else cos_tt.new_tensor(0.0),
+                "cos_tt_min":  cos_vals.min().detach()  if cos_vals.numel() else cos_tt.new_tensor(0.0),
+                "cos_tt_neg_frac": (cos_vals < 0).float().mean().detach() if cos_vals.numel() else cos_tt.new_tensor(0.0),
+            })
+
+            # ---- NEW: cosine of each task grad vs common summed grad (g_raw_c) ----
+            g_raw_c_norm = g_raw_c.norm() + eps
+            cos_to_rawc = (Gc @ g_raw_c) / (Gc_norm * g_raw_c_norm)  # [T]
+            stats.update({
+                "cos_to_rawc_mean": cos_to_rawc.mean().detach(),
+                "cos_to_rawc_min":  cos_to_rawc.min().detach(),
+                "cos_to_rawc_neg_frac": (cos_to_rawc < 0).float().mean().detach(),
+            })
 
             stats.update({
                 "rho_c_mean": rho_c.mean().detach(),
@@ -630,6 +670,7 @@ class GradAggregator:
                 "gpop_common_updated": can_update.float().detach(),
                 "Gpop_common_norm": (self.Gpop_common.norm() + eps).detach(),
                 "common_frac_params": cmask.float().mean().detach(),
+                "rho_c_gate_thr": rho_thr.detach(),
             })
  
         else:
@@ -639,6 +680,11 @@ class GradAggregator:
         grads_final = unflatten(g_final.detach(), self.params)
         for p, g in zip(self.params, grads_final):
             p.grad = g
+            
+        #  use can_update when mode is pgrs_common_gate and not update Gpop_common
+        if mode == "pgrs_common_gate" and (not can_update.item()):
+            for p in self.common_params:
+                p.grad = None
 
         # diagnostics
         with torch.no_grad():

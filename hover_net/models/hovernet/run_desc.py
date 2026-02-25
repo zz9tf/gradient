@@ -152,15 +152,24 @@ def train_step(batch_data, run_info):
             "gpop_common_updated",
             "Gpop_common_norm",
             "common_frac_params",
+            "rho_c_gate_thr",
+            "cos_tt_mean",
+            "cos_tt_min",
+            "cos_tt_neg_frac",
+            "cos_to_rawc_mean",
+            "cos_to_rawc_min",
+            "cos_to_rawc_neg_frac",
         ):
             if key in ls:
                 track_value(f"pgrs_common_gate/{key}", ls[key].item())
-        # pgrs_common_gate correlations: corr_dloss_align/<branch>
+        # pgrs_common_gate correlations: corr_dloss_align/<branch>, corr_dloss_rho/<branch>
         for name, val in ls.items():
             if name.startswith("corr_dloss_align/"):
-                # e.g. corr_dloss_align/np -> log as pgrs_common_gate/corr_dloss_align_np
                 suffix = name.split("/", 1)[1].replace("/", "_")
-                track_value(f"pgrs_common_gate/{suffix}", val.item())
+                track_value(f"pgrs_common_gate/corr_dloss_align_{suffix}", val.item())
+            if name.startswith("corr_dloss_rho/"):
+                suffix = name.split("/", 1)[1].replace("/", "_")
+                track_value(f"pgrs_common_gate/corr_dloss_rho_{suffix}", val.item())
 
     # (optional) ht_iters/ht_acc only exist for htdir mode
     if hasattr(grad_agg, "last_stats") and ("ht_iters" in grad_agg.last_stats):
