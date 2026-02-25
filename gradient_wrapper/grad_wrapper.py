@@ -237,18 +237,26 @@ class GradAggregator:
     def _pcgrad(self, G: torch.Tensor) -> torch.Tensor:
         eps = float(self.cfg.eps)
         T = G.shape[0]
-        Gm = G.clone()
+
+        Gm = G.clone()          # we will write modified gi here
+        Gref = G.detach()       # frozen reference for gj (or just use G)
+
         for i in range(T):
             gi = Gm[i]
             perm = torch.randperm(T, device=G.device)
-            for j in perm.tolist():
+
+            for j in perm:
+                j = int(j)
                 if i == j:
                     continue
-                gj = Gm[j]  # NOTE: use modified gradients for symmetry
+                gj = Gref[j]  # IMPORTANT: use original gradient as projection base
+                denom = torch.dot(gj, gj) + eps
                 dot = torch.dot(gi, gj)
                 if dot < 0:
-                    gi = gi - (dot / (torch.dot(gj, gj) + eps)) * gj
+                    gi = gi - (dot / denom) * gj
+
             Gm[i] = gi
+
         return Gm
 
     @torch.no_grad()

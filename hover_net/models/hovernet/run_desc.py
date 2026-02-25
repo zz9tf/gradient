@@ -377,7 +377,7 @@ def proc_valid_step_output(raw_data, nr_types=None):
     over_correct = 0
     prob_np = raw_data["prob_np"]
     true_np = raw_data["true_np"]
-    for idx in range(len(raw_data["true_np"])):
+    for idx in range(len(true_np)):
         patch_prob_np = prob_np[idx]
         patch_true_np = true_np[idx]
         patch_pred_np = np.array(patch_prob_np > 0.5, dtype=np.int32)
@@ -411,6 +411,9 @@ def proc_valid_step_output(raw_data, nr_types=None):
     # * HV regression statistic
     pred_hv = raw_data["pred_hv"]
     true_hv = raw_data["true_hv"]
+    print("run_desc.py: proc_valid_step_output:")
+    print(len(pred_hv))
+    print(len(true_hv))
 
     over_squared_error = 0
     for idx in range(len(raw_data["true_np"])):
