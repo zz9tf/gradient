@@ -690,9 +690,9 @@ class GradAggregator:
             p.grad = g
             
         #  use can_update when mode is pgrs_common_gate and not update Gpop_common
-        if mode == "pgrs_common_gate" and (not can_update.item()):
-            for p in self.common_params:
-                p.grad = None
+        # if mode == "pgrs_common_gate" and (not can_update.item()):
+        #     for p in self.common_params:
+        #         p.grad = None
 
         # diagnostics
         with torch.no_grad():

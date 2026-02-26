@@ -266,6 +266,8 @@ class TrainManager(Config):
             raise ValueError(f"Unknown run_mode: {run_mode}")
             
         for dir_path in data_dir_list:
+            if not os.path.isabs(dir_path):
+                dir_path = os.path.join(os.path.dirname(__file__), dir_path)
             file_list.extend(glob.glob("%s/*.npy" % dir_path))
         file_list.sort()  # to always ensure same input ordering
 

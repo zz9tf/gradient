@@ -1,4 +1,4 @@
-"""Run and summarize HoVer-Net test results across multiple runs.
+"""Run and summarize HoVer-Net test results across multiple runs (always re-running).
 
 Usage:
   run_test_summary.py <root> [--gpu=<id>] [--max-epoch=<n>] [--force=<0|1>] [--skip-errors=<0|1>]
@@ -9,7 +9,7 @@ Options:
   -h --help        Show this help message.
   --gpu=<id>       Comma-separated GPU list for CUDA_VISIBLE_DEVICES. [default: 0]
   --max-epoch=<n>  If set, select best checkpoint only among epochs <= n.
-  --force=<0|1>    If 1, re-run test even if <log_dir>_test/stats.json exists. [default: 0]
+  --force=<0|1>    (Accepted but ignored; tests are always re-run.) [default: 0]
   --skip-errors=<0|1>  If 1, skip runs that error instead of failing fast. [default: 0]
   --metric=<key>   Metric key to sort by (e.g. test-np_dice). If not provided,
                    the script will try common defaults (test-np_dice, test_np_dice,
@@ -22,14 +22,16 @@ Description:
   This script searches recursively under <root> for training run directories
   that contain a "stats.json" file and at least one "*_epoch=*.tar" checkpoint.
 
-  For each training "<log_dir>", it optionally runs test evaluation using
-  TrainManager.run_test(log_dir, max_epoch=...), producing:
-    "<log_dir>_test/stats.json"
+  For each training "<log_dir>", it:
+    - Runs test evaluation using TrainManager.run_test(log_dir, max_epoch=...),
+      which produces "<log_dir>_test/stats.json".
+    - Loads the "<log_dir>_test/stats.json".
+    - Selects the last epoch <= --max-epoch (if provided), otherwise the
+      numerically last epoch.
+    - Extracts all numeric metrics from that epoch.
 
-  By default it reuses existing test results if present, unless --force=1.
-  After ensuring test stats exist, it loads the last epoch's numeric metrics
-  from each "<log_dir>_test/stats.json", prints a summary table (one row per
-  run, relative to <root>), and optionally writes the same information as CSV.
+  It then prints a table with one row per run (relative to <root>), sorted by
+  the chosen metric, and optionally writes the same information as CSV.
 """
 
 import json
@@ -63,6 +65,7 @@ def _ensure_conda_lib_in_ld_path() -> None:
 
 _ensure_conda_lib_in_ld_path()
 
+
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
@@ -70,6 +73,7 @@ if ROOT not in sys.path:
 import torch  # noqa: E402
 
 from run_train import TrainManager  # noqa: E402
+
 
 def _has_any_checkpoint(log_dir: str) -> bool:
     """Check whether a directory contains at least one epoch checkpoint.
@@ -115,8 +119,11 @@ def _find_train_log_dirs(root: str) -> List[str]:
     return results
 
 
-def _load_last_epoch_metrics(stats_path: str) -> Tuple[int, Dict[str, float]]:
-    """Load the last epoch's numeric metrics from a stats.json file.
+def _load_last_epoch_metrics(
+    stats_path: str,
+    max_epoch: Optional[int] = None,
+) -> Tuple[int, Dict[str, float]]:
+    """Load the selected epoch's numeric metrics from a stats.json file.
 
     Args:
         stats_path: Path to a stats.json file as written by LoggingEpochOutput.
@@ -137,9 +144,18 @@ def _load_last_epoch_metrics(stats_path: str) -> Tuple[int, Dict[str, float]]:
         raise ValueError(f"Empty or invalid stats.json: {stats_path}")
 
     try:
-        epochs = sorted((int(k) for k in data.keys()))
+        all_epochs = sorted((int(k) for k in data.keys()))
     except ValueError as exc:
         raise ValueError(f"Non-integer epoch keys in {stats_path}") from exc
+
+    if max_epoch is not None:
+        epochs = [e for e in all_epochs if e <= max_epoch]
+        if not epochs:
+            raise ValueError(
+                f"No epochs <= max_epoch={max_epoch} found in {stats_path}"
+            )
+    else:
+        epochs = all_epochs
 
     last_epoch = epochs[-1]
     epoch_key = str(last_epoch)
@@ -272,9 +288,6 @@ def _write_csv(
     """
     import csv
 
-    if not rows:
-        raise ValueError("No rows available to write CSV.")
-
     fieldnames = ["run", "epoch"] + metric_keys
     with open(path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -290,23 +303,21 @@ def _ensure_test_stats(
     trainer: TrainManager,
     log_dir: str,
     max_epoch: Optional[int],
-    force: bool,
 ) -> str:
-    """Ensure "<log_dir>_test/stats.json" exists, optionally running test.
+    """Run test evaluation for a training log_dir and return stats.json path.
+
+    This always re-runs test (ignoring any existing *_test/stats.json).
 
     Args:
         trainer: TrainManager instance.
         log_dir: Training log directory.
         max_epoch: Optional max epoch constraint for best checkpoint selection.
-        force: If True, re-run test even if stats file already exists.
 
     Returns:
         Path to "<log_dir>_test/stats.json".
     """
     test_log_dir = log_dir.rstrip("/") + "_test"
     stats_path = os.path.join(test_log_dir, "stats.json")
-    if not force and os.path.isfile(stats_path):
-        return stats_path
 
     trainer.run_test(log_dir, max_epoch=max_epoch)
     if not os.path.isfile(stats_path):
@@ -316,7 +327,6 @@ def _ensure_test_stats(
         )
     return stats_path
 
-
 def main() -> None:
     """Entry point for the CLI script."""
     args = docopt(__doc__)
@@ -325,7 +335,8 @@ def main() -> None:
     csv_path = args.get("--csv")
     sort_order = (args.get("--sort") or "desc").lower()
     gpu = args.get("--gpu") or "0"
-    force = bool(int(args.get("--force") or 0))
+    # force is accepted for backward compatibility but ignored: tests always re-run
+    _force = bool(int(args.get("--force") or 0))
     skip_errors = bool(int(args.get("--skip-errors") or 0))
     max_epoch_raw = args.get("--max-epoch")
     max_epoch = int(max_epoch_raw) if max_epoch_raw is not None else None
@@ -341,17 +352,19 @@ def main() -> None:
     trainer = TrainManager(grad_overrides={})
     trainer.nr_gpus = torch.cuda.device_count()
     print(
-        "Using %d GPU(s). Root: %s. Runs: %d. max_epoch=%s. force=%s"
-        % (trainer.nr_gpus, os.path.abspath(root), len(train_log_dirs), str(max_epoch), str(force))
+        "Using %d GPU(s). Root: %s. Runs: %d. max_epoch=%s"
+        % (trainer.nr_gpus, os.path.abspath(root), len(train_log_dirs), str(max_epoch))
     )
 
     rows: List[Dict[str, object]] = []
     for log_dir in train_log_dirs:
         try:
             test_stats_path = _ensure_test_stats(
-                trainer=trainer, log_dir=log_dir, max_epoch=max_epoch, force=force
+                trainer=trainer,
+                log_dir=log_dir,
+                max_epoch=max_epoch,
             )
-            epoch, metrics = _load_last_epoch_metrics(test_stats_path)
+            epoch, metrics = _load_last_epoch_metrics(test_stats_path, max_epoch=max_epoch)
             rel_run = os.path.relpath(log_dir, root)
             row: Dict[str, object] = {"run": rel_run, "epoch": epoch}
             row.update(metrics)
