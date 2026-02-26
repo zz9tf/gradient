@@ -26,7 +26,7 @@ if __name__ == "__main__":
     xtractor = PatchExtractor(win_size, step_size)
 
     # Your data root directory
-    data_root = Path("/home/zz/zheng/gradient/MoNuSAC")
+    data_root = Path("/home/zheng/zheng/gradient/MoNuSAC")
 
     save_root = Path("dataset/monusac")
 
