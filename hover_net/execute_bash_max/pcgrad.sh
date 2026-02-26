@@ -6,4 +6,4 @@ source /home/zz/miniconda3/etc/profile.d/conda.sh
 conda activate hovernet_h100
 cd /home/zz/zheng/gradient/hover_net
 
-python run_train.py --gpu "$GPU_ID" --grad-mode pcgrad
+python run_train.py --gpu "$GPU_ID" --grad-mode pcgrad --resume-path /home/zz/zheng/gradient/hover_net/logs/valid_one/grad_pgrs_common_gate_gw1

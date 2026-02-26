@@ -412,10 +412,6 @@ def proc_valid_step_output(raw_data, nr_types=None):
     # * HV regression statistic
     pred_hv = raw_data["pred_hv"]
     true_hv = raw_data["true_hv"]
-    print("run_desc.py: proc_valid_step_output:")
-    print("len(true_np) =", len(true_np))
-    print("len(prob_np) =", len(prob_np))
-    print("keys:", raw_data.keys())
 
     over_squared_error = 0
     for idx in range(len(raw_data["true_np"])):

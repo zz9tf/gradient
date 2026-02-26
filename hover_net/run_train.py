@@ -4,6 +4,7 @@ Main HoVer-Net training script.
 
 Usage:
   run_train.py [--gpu=<id>] [--view=<dset>] [--resume=<path>]
+    [--batch-train=<n>] [--batch-valid=<n>]
     [--grad-mode=<m>] [--grad-beta=<f>] [--grad-tau=<f>] [--grad-eps=<f>]
     [--grad-gpop-key=<key>] [--grad-gpop-use-weight=<0|1>]
     [--grad-dir-beta=<f>] [--grad-dir-k=<f>] [--grad-dir-reject-max=<n>]
@@ -17,6 +18,8 @@ Options:
   --gpu=<id>              Comma separated GPU list. [default: 0,1,2,3]
   --view=<dset>           Visualise images after augmentation. Choose 'train' or 'valid'.
   --resume=<path>         Resume training from this log dir (same grad overrides; set nr_epochs in opt to target total epochs).
+  --batch-train=<n>       Batch size for training (per GPU). Overrides phase config.
+  --batch-valid=<n>       Batch size for validation and test (per GPU). Overrides phase config.
   --grad-mode=<m>         Gradient aggregation mode: sum|pcgrad|graddrop|pgrs|pgrs_lambda|pgrs_lpf1|pgrs_stage|pgrs_common_gate|htdir (overrides config).
   --grad-beta=<f>         PGRS EMA beta, e.g. 0.999 (overrides config).
   --grad-tau=<f>          PGRS alignment threshold, e.g. 0.2 (overrides config).
@@ -165,21 +168,49 @@ def _grad_overrides_to_log_suffix(grad_overrides):
     return "_".join(parts)
 
 
+def _batch_overrides_to_log_suffix(batch_overrides):
+    """
+    Build a log dir suffix from batch overrides (only when any override is set).
+    E.g. {"train": 16} -> "_bt_16", {"valid": 8} -> "_bv_8", both -> "_bt_16_bv_8".
+
+    Returns:
+        str: suffix including leading underscore, or "" if no overrides.
+    """
+    if not batch_overrides:
+        return ""
+    parts = []
+    if "train" in batch_overrides:
+        parts.append("bt_%d" % int(batch_overrides["train"]))
+    if "valid" in batch_overrides:
+        parts.append("bv_%d" % int(batch_overrides["valid"]))
+    return "_" + "_".join(parts) if parts else ""
+
+
 ####
 class TrainManager(Config):
     """Either used to view the dataset or to initialise the main training loop."""
 
-    def __init__(self, grad_overrides=None, resume_path=None):
+    def __init__(self, grad_overrides=None, resume_path=None, batch_overrides=None):
         """
         Args:
             grad_overrides: Optional dict to override GradAggConfig
                 (mode, beta, tau, eps, dir_beta, dir_k, dir_reject_max, loss_switch, common_gate_rho_thr).
             resume_path: If set, resume training from this log dir (same grad overrides; set nr_epochs in opt to target total).
+            batch_overrides: Optional dict to override batch_size, e.g. {"train": 16, "valid": 8}.
         """
         super().__init__()
         self.grad_overrides = grad_overrides or {}
         self.resume_path = resume_path
+        self.batch_overrides = batch_overrides or {}
         return
+
+    def _apply_batch_overrides(self, batch_size_dict):
+        """Return a copy of batch_size_dict with self.batch_overrides applied (only for existing keys)."""
+        out = dict(batch_size_dict)
+        for k, v in self.batch_overrides.items():
+            if k in out:
+                out[k] = v
+        return out
 
     ####
     def view_dataset(self, mode="train"):
@@ -304,11 +335,12 @@ class TrainManager(Config):
                 log_info = {"json_file": json_log_file, "tfwriter": tfwriter}
 
         ####
+        batch_size = self._apply_batch_overrides(opt["batch_size"])
         loader_dict = {}
         for runner_name, runner_opt in run_engine_opt.items():
             print(f"Runner name: {runner_name}")
             loader_dict[runner_name] = self._get_datagen(
-                opt["batch_size"][runner_name],
+                batch_size[runner_name],
                 runner_name,
                 opt["target_info"]["gen"],
                 nr_procs=runner_opt["nr_procs"],
@@ -489,17 +521,20 @@ class TrainManager(Config):
         return
 
     ####
-    def run_test(self, log_dir):
+    def run_test(self, log_dir, max_epoch=None):
         """
         Run test evaluation on the test dataset after training.
-        
+
         Args:
-            log_dir: Directory containing the trained model checkpoints
+            log_dir: Directory containing the trained model checkpoints.
+            max_epoch: If set, choose best checkpoint only among epochs <= max_epoch (inclusive).
         """
         print("\n" + "="*60)
         print("Starting Test Evaluation")
+        if max_epoch is not None:
+            print("Best checkpoint limited to epoch <= %d" % max_epoch)
         print("="*60 + "\n")
-        
+
         check_manual_seed(self.seed)
         
         # Get the last phase's checkpoint
@@ -521,7 +556,8 @@ class TrainManager(Config):
         }
         
         # Get test dataloader (use valid batch_size as default)
-        test_batch_size = last_phase_info["batch_size"].get("test", last_phase_info["batch_size"].get("valid", 8))
+        phase_batch = self._apply_batch_overrides(last_phase_info["batch_size"])
+        test_batch_size = phase_batch.get("test", phase_batch.get("valid", 8))
         test_loader = self._get_datagen(
             batch_size=test_batch_size,
             run_mode="test",
@@ -529,34 +565,39 @@ class TrainManager(Config):
             nr_procs=8,  # Use same as valid
         )
         
+        max_epoch_for_best = max_epoch
+
         # Load the best model from training
         def get_best_chkpt_path(phase_dir, net_name):
-            """Get the best checkpoint path based on validation metrics."""
+            """Get the best checkpoint path by valid-np_dice (optionally only epochs <= max_epoch_for_best)."""
             stat_file_path = phase_dir + "/stats.json"
             if not os.path.exists(stat_file_path):
-                # Fallback to last checkpoint
                 return get_last_chkpt_path(phase_dir, net_name)
-            
+
             with open(stat_file_path) as stat_file:
                 info = json.load(stat_file)
-            
-            # Find epoch with best validation dice
+
             best_epoch = None
             best_dice = -1
             for epoch_str, epoch_data in info.items():
-                if "valid" in epoch_data:
-                    valid_data = epoch_data["valid"]
-                    if "np_dice" in valid_data:
-                        dice = valid_data["np_dice"]
-                        if dice > best_dice:
-                            best_dice = dice
-                            best_epoch = int(epoch_str)
-            
+                epoch_int = int(epoch_str)
+                if max_epoch_for_best is not None and epoch_int > max_epoch_for_best:
+                    continue
+                dice = None
+                if isinstance(epoch_data.get("valid"), dict) and "np_dice" in epoch_data["valid"]:
+                    dice = epoch_data["valid"]["np_dice"]
+                if dice is None:
+                    dice = epoch_data.get("valid-np_dice")
+                if dice is not None and dice > best_dice:
+                    best_dice = dice
+                    best_epoch = epoch_int
+
             if best_epoch is None:
-                # Fallback to last checkpoint
                 epoch_list = [int(v) for v in info.keys()]
-                best_epoch = max(epoch_list)
-            
+                if max_epoch_for_best is not None:
+                    epoch_list = [e for e in epoch_list if e <= max_epoch_for_best]
+                best_epoch = max(epoch_list) if epoch_list else max(int(v) for v in info.keys())
+
             chkpt_path = "%s/%s_epoch=%d.tar" % (phase_dir, net_name, best_epoch)
             return chkpt_path
         
@@ -664,6 +705,8 @@ class TrainManager(Config):
 
         # When gradient CLI overrides are used, write results to a different subdir.
         base_log_dir = self.log_dir.rstrip("/")
+        phase_list = self.model_config["phase_list"]
+
         if self.resume_path:
             base_log_dir = os.path.abspath(self.resume_path)
             print("Resume -> log dir: %s" % base_log_dir)
@@ -672,8 +715,21 @@ class TrainManager(Config):
             if grad_suffix:
                 base_log_dir = base_log_dir + "/" + grad_suffix
                 print("Gradient overrides active -> log dir: %s" % base_log_dir)
+            batch_suffix = _batch_overrides_to_log_suffix(self.batch_overrides)
+            if batch_suffix:
+                base_log_dir = base_log_dir + batch_suffix
+                print("Batch overrides active -> log dir: %s" % base_log_dir)
 
-        phase_list = self.model_config["phase_list"]
+            # Encode epoch schedule into log dir name, e.g. ep20_40 for
+            # phase_list nr_epochs [20, 20] -> first=20, total=40.
+            if phase_list:
+                phase_epochs = [int(p.get("nr_epochs", 0)) for p in phase_list]
+                first_ep = phase_epochs[0] if phase_epochs else 0
+                total_ep = sum(phase_epochs)
+                if first_ep > 0 and total_ep > 0:
+                    base_log_dir = f"{base_log_dir}/ep{first_ep}_{total_ep}"
+                    print("Epoch schedule -> log dir: %s" % base_log_dir)
+
         engine_opt = self.model_config["run_engine"]
 
         prev_save_path = None
@@ -694,14 +750,31 @@ class TrainManager(Config):
         self.run_test(final_save_path)
 
 
+def _parse_batch_overrides(args):
+    """Build batch_overrides dict from CLI (train, valid). Only includes keys that are set."""
+    overrides = {}
+    if args.get("--batch-train"):
+        overrides["train"] = int(args["--batch-train"])
+    if args.get("--batch-valid"):
+        overrides["valid"] = int(args["--batch-valid"])
+    return overrides
+
+
 ####
 if __name__ == "__main__":
     args = docopt(__doc__, version="HoVer-Net v1.0")
     grad_overrides = _parse_grad_overrides(args)
+    batch_overrides = _parse_batch_overrides(args)
     if grad_overrides:
         print("Gradient CLI overrides:", grad_overrides)
+    if batch_overrides:
+        print("Batch CLI overrides:", batch_overrides)
     resume_path = args.get("--resume") or None
-    trainer = TrainManager(grad_overrides=grad_overrides, resume_path=resume_path)
+    trainer = TrainManager(
+        grad_overrides=grad_overrides,
+        resume_path=resume_path,
+        batch_overrides=batch_overrides,
+    )
 
     if args["--view"]:
         if args["--view"] != "train" and args["--view"] != "valid":

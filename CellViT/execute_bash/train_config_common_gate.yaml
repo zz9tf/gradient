@@ -3,7 +3,7 @@
 logging:
   mode: offline
   project: cellvit-monusac
-  notes: ""
+  notes: "always update Gpop_common with raw common gradient"
   log_comment: monusac_run
   tags: []
   wandb_dir: /home/zz/zheng/gradient/CellViT/logs
