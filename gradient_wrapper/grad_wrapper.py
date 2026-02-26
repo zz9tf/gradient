@@ -621,8 +621,8 @@ class GradAggregator:
 
             # parameter update uses raw full gradient (no surgery)
             g_final = g_raw.clone()
-            # if not can_update.item():
-            g_final[cmask] = 0.0
+            if not can_update.item():
+                g_final[cmask] = 0.0
 
             # gated update of Gpop_common (use RAW common grad to avoid self-locking)
             if can_update.item():
