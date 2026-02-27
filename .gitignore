@@ -212,6 +212,9 @@ __marimo__/
 # Training logs and checkpoints
 logs/
 mtl_cifar/runs_cifar/
+hover_net/dataset/
+CellViT/logs/
+MoNuSAC/train/
 *.tar
 *.npz
 events.out.tfevents.*
