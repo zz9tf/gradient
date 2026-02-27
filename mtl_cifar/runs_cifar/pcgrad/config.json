@@ -1,0 +1,13 @@
+{
+  "seed": 0,
+  "device": "cuda",
+  "batch_size": 8,
+  "epochs": 30,
+  "lr": 0.1,
+  "wd": 0.0005,
+  "num_workers": 4,
+  "w_cls": 1.0,
+  "w_rot": 1.0,
+  "w_rec": 1.0,
+  "grad_mode": "pcgrad"
+}

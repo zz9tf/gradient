@@ -1,9 +1,16 @@
+# grad_wrapper.py
+# Wrapper：统一计算 per-task grads，然后按 mode 调 A/B/C 策略，最后写回 .grad
 import torch
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Callable, Tuple
 
+from gradient_wrapper.grad_surgery import sum_grad, pcgrad, graddrop, mgda_min_norm, cagrad
+from gradient_wrapper.grad_weight import (
+    dwa_weights, gradnorm_weights, uw_heuristic_weights, apply_weighting_then_sum
+)
+from gradient_wrapper.grad_pareto import nash_mtl
+from gradient_wrapper.grad_gpop import GpopCommonGate, GpopConfig
 
-# ----------------------------- utils -----------------------------
 
 def named_params(
     model: torch.nn.Module,
@@ -48,368 +55,123 @@ def gradvec(loss: torch.Tensor, params: List[torch.nn.Parameter], retain_graph: 
     return flatten(grads)
 
 
-# ----------------------------- config -----------------------------
-
 @dataclass
 class GradAggConfig:
-    mode: str = "pgrs"   # sum | pcgrad | graddrop | pgrs | pgrs_lambda | htdir | pgrs_stage | pgrs_lpf1 | pgrs_common_gate
+    mode: str = "sum"
     eps: float = 1e-8
 
-    # PGRS
-    beta: float = 0.999
-    tau: float = 0.2
+    # A: CAGrad
+    cagrad_alpha: float = 0.5
+    cagrad_iters: int = 60
+    cagrad_lr: float = 0.2
 
-    # heavy-tailed direction sampling (optional mode)
-    dir_beta: float = 5.0
-    dir_k: float = 2.0
-    dir_reject_max: int = 64
-    # --- NEW: stage switch ---
-    loss_switch: float = 10.0   # overall_loss_raw < loss_switch => late-stage
+    # A: MGDA
+    mgda_iters: int = 80
+    mgda_lr: float = 0.2
+
+    # C: Nash-MTL
+    nash_iters: int = 80
+    nash_lr: float = 0.2
+
+    # B: DWA
+    dwa_T: float = 2.0
+
+    # B: GradNorm
+    gradnorm_alpha: float = 1.5
+
+    # B: UW heuristic
+    uw_beta: float = 0.9
     
-    common_gate_rho_thr: float = 0.0
+    # ---- Gpop common gate (optional) ----
+    gpop_enabled: bool = False
+    gpop_beta: float = 0.99
+    gpop_rho_thr: float = 0.0
+    gpop_freeze_common_on_fail: bool = True
+    gpop_sup_lambda: float = 0.0
+    gpop_sup_mode: str = "pull_to_gpop"  # pull_to_gpop | proj_to_gpop
 
     def validate(self):
         m = self.mode.lower()
-        if m in ("pgrs", "pgrs_stage", "pgrs_lambda", "pgrs_lpf1", "pgrs_common_gate"):
-            if not (0.0 <= float(self.tau) <= 1.0):
-                raise ValueError(f"[{m}] tau must be in [0,1], got {self.tau}")
-            if not (0.0 < float(self.beta) < 1.0):
-                raise ValueError(f"[{m}] beta must be in (0,1), got {self.beta}")
-            if float(self.loss_switch) <= 0:
-                raise ValueError(f"[{m}] loss_switch must be > 0, got {self.loss_switch}")
-        if m == "htdir":
-            if self.dir_beta <= 0:
-                raise ValueError(f"[htdir] dir_beta must be > 0, got {self.dir_beta}")
-            if self.dir_k <= 0:
-                raise ValueError(f"[htdir] dir_k must be > 0, got {self.dir_k}")
-        if m == "pgrs_common_gate":
-            thr = float(self.common_gate_rho_thr)
-            if not (-1.0 <= thr <= 1.0):
-                raise ValueError(
-                    f"[pgrs_common_gate] common_gate_rho_thr must be in [-1,1], got {thr}"
-                )
+        allowed = {
+            # A
+            "sum", "pcgrad", "graddrop", "mgda", "cagrad",
+            # B
+            "dwa", "gradnorm", "uw_heuristic",
+            # C
+            "nash_mtl",
+        }
+        if self.gpop_enabled:
+            GpopConfig(
+                enabled=True,
+                beta=self.gpop_beta,
+                rho_thr=self.gpop_rho_thr,
+                freeze_common_on_fail=self.gpop_freeze_common_on_fail,
+                sup_lambda=self.gpop_sup_lambda,
+                sup_mode=self.gpop_sup_mode,
+                eps=self.eps,
+            ).validate()
+        if m not in allowed:
+            raise ValueError(f"Unknown mode: {self.mode}. Allowed: {sorted(list(allowed))}")
 
-# ----------------------------- aggregator -----------------------------
 
 class GradAggregator:
-    """
-    Single-space gradient aggregation on all selected params.
-    Writes .grad directly (no "fill then overwrite" logic).
-
-    Modes:
-      - sum
-      - pcgrad
-      - graddrop
-      - pgrs (GLOBAL EMA Gpop + rho gate)
-      - htdir
-    """
-
     def __init__(
         self,
         model: torch.nn.Module,
         cfg: GradAggConfig,
         param_filter: Optional[Callable[[str, torch.nn.Parameter], bool]] = None,
-        common_param_filter: Optional[Callable[[str, torch.nn.Parameter], bool]] = None,
-        verbose: bool = True,
+        common_param_filter=None, 
+        verbose=True
     ):
         self.model = model
         self.cfg = cfg
         self.cfg.validate()
 
         named_all = named_params(model, only=param_filter)
+        
+        self._named_all = [(n, p) for n, p in named_all]  # [(name, param)]
+        self.gpop = None
+        if bool(getattr(self.cfg, "gpop_enabled", False)):
+            if common_param_filter is None:
+                raise ValueError("gpop_enabled=True but common_param_filter is None")
+            gpcfg = GpopConfig(
+                enabled=True,
+                beta=self.cfg.gpop_beta,
+                rho_thr=self.cfg.gpop_rho_thr,
+                freeze_common_on_fail=self.cfg.gpop_freeze_common_on_fail,
+                sup_lambda=self.cfg.gpop_sup_lambda,
+                sup_mode=self.cfg.gpop_sup_mode,
+                eps=self.cfg.eps,
+            )
+            self.gpop = GpopCommonGate(self._named_all, common_param_filter=common_param_filter, cfg=gpcfg)
+            if verbose:
+                print("[gpop] common tensors:", len(self.gpop.common_names), "examples:", self.gpop.common_names[:5])
+        
+        if len(named_all) == 0:
+            raise ValueError("No trainable params selected.")
 
-        if common_param_filter is None:
-            raise ValueError("You want split management, so common_param_filter must be provided.")
-
-        named_common = [(n, p) for (n, p) in named_all if common_param_filter(n, p)]
-        named_priv   = [(n, p) for (n, p) in named_all if not common_param_filter(n, p)]
-
-        if len(named_common) == 0:
-            raise ValueError("common_param_filter selected 0 params.")
-        if len(named_priv) == 0:
-            raise ValueError("private params are empty (common selected everything).")
-
-        self.common_names = [n for n, _ in named_common]
-        self.common_params = [p for _, p in named_common]
-
-        self.priv_names = [n for n, _ in named_priv]
-        self.priv_params = [p for _, p in named_priv]
-
-        # for global stats only (optional)
         self.all_names = [n for n, _ in named_all]
         self.params = [p for _, p in named_all]
-        # ---- NEW: mask over flattened FULL parameter vector for common subset ----
-        mask = []
-        for (n, p) in named_all:
-            # 这里用 common_param_filter 来决定这个 param 属不属于 common
-            is_common = bool(common_param_filter(n, p))
-            mask.append(torch.full((p.numel(),), is_common, dtype=torch.bool))
-        self._common_mask_cpu = torch.cat(mask, dim=0)  # [P] on CPU
 
-        if verbose:
-            print("[grad] common tensors:", len(self.common_params), "examples:", self.common_names[:5])
-            print("[grad] priv   tensors:", len(self.priv_params),   "examples:", self.priv_names[:5])
+        # ---- B-method states ----
+        self._prev_losses_1: Optional[torch.Tensor] = None  # L(k-1)
+        self._prev_losses_2: Optional[torch.Tensor] = None  # L(k-2)
+        self._init_losses: Optional[torch.Tensor] = None
+        self._uw_state: Optional[Dict[str, torch.Tensor]] = None
 
-        # state
-        self.Gpop_common: Optional[torch.Tensor] = None  # only for common space
-        self.Gpop: Optional[torch.Tensor] = None         # keep if you still want old modes
-
+        # diagnostics
         self.last_stats: Dict[str, torch.Tensor] = {}
         self.overall_loss_raw: Optional[torch.Tensor] = None
         self.shrink_ratio: Optional[torch.Tensor] = None
         self.cos_raw_final: Optional[torch.Tensor] = None
-        self._is_late = False
-        
-        # --- NEW: correlation tracking state (per loss key) ---
-        self.corr_beta = 0.99  # 你也可以放到 cfg 里
-        self._corr_state = {}  # key -> dict of running moments
-        self._prev_loss = {}  # key -> last loss scalar
 
-    def _common_mask(self, device):
-        return self._common_mask_cpu.to(device=device)
-    
-    @torch.no_grad()
-    def _ema_corr_update(self, key: str, x: torch.Tensor, y: torch.Tensor, beta: float, eps: float):
-        """
-        Track EMA Pearson correlation between scalar x and y.
-        Keeps running mean, var, cov, and returns corr in [-1,1].
-        """
-        st = self._corr_state.get(key, None)
-        if st is None:
-            st = {
-                "mx": x.detach(),
-                "my": y.detach(),
-                "vx": torch.zeros_like(x),
-                "vy": torch.zeros_like(y),
-                "cxy": torch.zeros_like(x),
-                "corr": torch.zeros_like(x),
-            }
+        if verbose:
+            print("[grad] tensors:", len(self.params), "examples:", self.all_names[:5])
 
-        mx, my = st["mx"], st["my"]
-        # update means
-        mx_new = beta * mx + (1 - beta) * x
-        my_new = beta * my + (1 - beta) * y
-
-        # centered
-        dx = x - mx_new
-        dy = y - my_new
-
-        # update variances/cov
-        vx_new = beta * st["vx"] + (1 - beta) * (dx * dx)
-        vy_new = beta * st["vy"] + (1 - beta) * (dy * dy)
-        cxy_new = beta * st["cxy"] + (1 - beta) * (dx * dy)
-
-        corr = cxy_new / (vx_new.sqrt() * vy_new.sqrt() + eps)
-
-        st.update({"mx": mx_new, "my": my_new, "vx": vx_new, "vy": vy_new, "cxy": cxy_new, "corr": corr})
-        self._corr_state[key] = st
-        return corr
-
-    def state_dict(self):
-        return {
-            "mode": self.cfg.mode,
-            "Gpop": None if self.Gpop is None else self.Gpop.detach().cpu(),
-            "Gpop_common": None if self.Gpop_common is None else self.Gpop_common.detach().cpu(),  # NEW
-        }
-
-    def load_state_dict(self, st, strict: bool = False):
-        if st is None:
-            self.Gpop = None
-            self.Gpop_common = None
-            return
-        try:
-            dev, dt = self.params[0].device, self.params[0].dtype
-
-            g = st.get("Gpop", None)
-            self.Gpop = None if g is None else g.to(device=dev, dtype=dt)
-
-            gc = st.get("Gpop_common", None)
-            self.Gpop_common = None if gc is None else gc.to(device=dev, dtype=dt)
-        except Exception:
-            if strict:
-                raise
-            self.Gpop = None
-            self.Gpop_common = None
-
-    # ------------------------- strategies -------------------------
-
-    @torch.no_grad()
-    def _pcgrad(self, G: torch.Tensor) -> torch.Tensor:
-        eps = float(self.cfg.eps)
-        T = G.shape[0]
-
-        Gm = G.clone()          # we will write modified gi here
-        Gref = G.detach()       # frozen reference for gj (or just use G)
-
-        for i in range(T):
-            gi = Gm[i]
-            perm = torch.randperm(T, device=G.device)
-
-            for j in perm:
-                j = int(j)
-                if i == j:
-                    continue
-                gj = Gref[j]  # IMPORTANT: use original gradient as projection base
-                denom = torch.dot(gj, gj) + eps
-                dot = torch.dot(gi, gj)
-                if dot < 0:
-                    gi = gi - (dot / denom) * gj
-
-            Gm[i] = gi
-
-        return Gm
-
-    @torch.no_grad()
-    def _graddrop(self, G: torch.Tensor, w: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        eps = float(self.cfg.eps)
-        Gw = w * G
-        S = Gw.sum(dim=0)
-        A = Gw.abs().sum(dim=0)
-        P = 0.5 * (1.0 + S / (A + eps))
-
-        U = torch.rand_like(P)
-        choose_pos = (P > U)
-
-        signs = torch.sign(Gw)
-        mask = torch.ones_like(Gw)
-
-        drop_pos = (~choose_pos)[None, :] & (signs > 0)
-        drop_neg = ( choose_pos)[None, :] & (signs < 0)
-        mask[drop_pos | drop_neg] = 0.0
-
-        g_final = (Gw * mask).sum(dim=0)
-        conflict = ((signs > 0).any(dim=0) & (signs < 0).any(dim=0))
-        stats = {"conflict_frac": conflict.float().mean(), "P_mean": P.mean()}
-        return g_final, stats
-
-    @torch.no_grad()
-    def _sample_ht_direction(self, G: torch.Tensor, w: torch.Tensor):
-        eps = float(self.cfg.eps)
-        b = float(self.cfg.dir_beta)
-        k = float(self.cfg.dir_k)
-        max_it = int(self.cfg.dir_reject_max)
-
-        device, dtype = G.device, G.dtype
-
-        norms = G.norm(dim=1) + eps
-        Gh = G / norms[:, None]
-        a = (w.squeeze(1) * norms)
-        Amax = a.sum() + eps
-
-        it_used = 0
-        v = None
-        last_acc = None
-        for it in range(max_it):
-            it_used = it + 1
-            x = torch.randn(G.shape[1], device=device, dtype=dtype)
-            v_try = x / (x.norm() + eps)
-
-            z = Gh @ v_try
-            phi = (1.0 + b * (1.0 - z)).pow(-k)
-            Aval = torch.dot(a, phi)
-            acc = Aval / Amax
-            last_acc = acc
-
-            if torch.rand((), device=device, dtype=dtype) < acc:
-                v = v_try
-                break
-            v = v_try
-
-        stats = {
-            "ht_iters": torch.tensor(it_used, device=device),
-            "ht_acc": last_acc.detach() if last_acc is not None else torch.tensor(0.0, device=device),
-        }
-        return v, stats
-
-    @torch.no_grad()
-    def _update_gpop_common(self, g_for_gpop_common: torch.Tensor) -> torch.Tensor:
-        """EMA update for common reference gradient."""
-        beta = float(self.cfg.beta)
-        if self.Gpop_common is None:
-            raise ValueError("Gpop_common is not initialized")
-        self.Gpop_common = beta * self.Gpop_common + (1.0 - beta) * g_for_gpop_common.detach()
-        return self.Gpop_common
-
-    @torch.no_grad()
-    def _update_gpop(self, g_for_gpop: torch.Tensor) -> torch.Tensor:
-        """EMA update of population/reference gradient."""
-        beta = float(self.cfg.beta)
-        if self.Gpop is None:
-            raise ValueError("Gpop is not initialized")
-        self.Gpop = beta * self.Gpop + (1.0 - beta) * g_for_gpop.detach()
-        return self.Gpop
-
-    @torch.no_grad()
-    def _rho(self, G: torch.Tensor, Gpop: torch.Tensor) -> torch.Tensor:
-        """cosine alignment rho_t between each task gradient and Gpop. returns [T]."""
-        eps = float(self.cfg.eps)
-        Gpop_norm = Gpop.norm() + eps
-        G_norm = G.norm(dim=1) + eps
-        return (G @ Gpop) / (G_norm * Gpop_norm)
-
-    @torch.no_grad()
-    def _pgrs_projection_surgery(self, G: torch.Tensor, Gpop: torch.Tensor, tau: float):
-        """
-        Surgery (projection-based, 3-case):
-          rho<0: drop
-          0<=rho<tau: remove projection onto Gpop
-          rho>=tau: keep
-        returns (Gprime [T,P], stats)
-        """
-        eps = float(self.cfg.eps)
-        rho = self._rho(G, Gpop)
-
-        den = (Gpop @ Gpop) + eps
-        alpha = (G @ Gpop) / den
-        proj = alpha[:, None] * Gpop[None, :]
-
-        Gprime = G.clone()
-        neg = (rho < 0)
-        mid = (rho >= 0) & (rho < tau)
-
-        Gprime[neg] = 0.0
-        Gprime[mid] = G[mid] - proj[mid]
-
-        st = {
-            "rho_mean": rho.mean(),
-            "rho_min": rho.min(),
-            "rho_max": rho.max(),
-            "kept_frac": (rho >= tau).float().mean(),
-            "mid_frac": mid.float().mean(),
-            "drop_frac": neg.float().mean(),
-        }
-        return Gprime, st
-
-    @torch.no_grad()
-    def _conf_lambda(self, G: torch.Tensor, Gpop: torch.Tensor):
-        """
-        lambda/conf = ||Gpop|| / ( (1/T) * sum ||g_i|| )
-        returns (lam in [0,1], conf unclamped, mean_g_norm)
-        """
-        eps = float(self.cfg.eps)
-        eps_conf = float(getattr(self.cfg, "eps_conf", eps))
-
-        Gpop_norm = Gpop.norm() + eps
-        mean_g_norm = (G.norm(dim=1) + eps).mean()
-        conf = Gpop_norm / (mean_g_norm + eps)
-        lam = conf.clamp(0.0, 1.0)
-        if lam.item() < eps_conf:
-            lam = lam.new_tensor(0.0)
-        return lam, conf, mean_g_norm
-
-    # ------------------------- main entry -------------------------
-
-    def backward(
-        self,
-        losses: Dict[str, torch.Tensor],
-        weights: Optional[Dict[str, float]] = None,
-        gpop_key: Optional[str] = None,
-        gpop_use_weight: bool = True,
-    ):
+    def backward(self, losses: Dict[str, torch.Tensor], weights: Optional[Dict[str, float]] = None):
         if weights is None:
             weights = {k: 1.0 for k in losses.keys()}
 
-        # clear grads
         for p in self.params:
             p.grad = None
 
@@ -418,284 +180,163 @@ class GradAggregator:
         device = next(iter(losses.values())).device
         eps = float(self.cfg.eps)
 
-        # raw objective for logging
+        # per-task gradients (global space)
+        w_external = torch.tensor(
+            [float(weights.get(k, 1.0)) for k in names],
+            device=device,
+            dtype=next(iter(losses.values())).dtype,
+        ).view(T, 1)
+
+        g_list = []
+        for i, k in enumerate(names):
+            rg = (i != T - 1)
+            g_list.append(gradvec(losses[k], self.params, retain_graph=rg))
+        G = torch.stack(g_list, dim=0)  # [T,P]
+
+        # raw baseline
+        g_raw = (w_external * G).sum(dim=0)
+
+        mode = self.cfg.mode.lower()
+        MODE2ID = {
+            "sum": 0, "pcgrad": 1, "graddrop": 2, "mgda": 3, "cagrad": 4,
+            "dwa": 10, "gradnorm": 11, "uw_heuristic": 12,
+            "nash_mtl": 20,
+        }
+        stats: Dict[str, torch.Tensor] = {"mode_id": torch.tensor(MODE2ID.get(mode, -1), device=device)}
+        # ===== conflict geometry logs (raw, before aggregation) =====
+        with torch.no_grad():
+            # per-task norms
+            g_t_norm = G.norm(dim=1) + eps  # [T]
+
+            # pairwise cosine among task grads
+            G_unit = G / g_t_norm[:, None]  # [T,P]
+            cos_tt = G_unit @ G_unit.T      # [T,T]
+            triu = torch.triu(torch.ones_like(cos_tt, dtype=torch.bool), diagonal=1)
+            cos_vals = cos_tt[triu]
+            stats_geom = {
+                "cos_tt_mean": cos_vals.mean() if cos_vals.numel() else cos_tt.new_tensor(0.0),
+                "cos_tt_min":  cos_vals.min()  if cos_vals.numel() else cos_tt.new_tensor(0.0),
+                "cos_tt_neg_frac": (cos_vals < 0).float().mean() if cos_vals.numel() else cos_tt.new_tensor(0.0),
+            }
+
+            # raw violation: whether raw summed gradient hurts a task (1st-order)
+            dot_t_raw = (G @ g_raw)  # [T]
+            raw_viol_frac = (dot_t_raw < 0).float().mean()
+
+            stats_geom.update({
+                "raw_viol_frac": raw_viol_frac,
+                "dot_raw_min": dot_t_raw.min(),
+                "dot_raw_mean": dot_t_raw.mean(),
+            })
+            
+        stats.update(stats_geom)
         with torch.no_grad():
             self.overall_loss_raw = sum(losses[k].detach() * float(weights.get(k, 1.0)) for k in names)
 
-        # per-task gradients (global space)
-        w_list = [float(weights.get(k, 1.0)) for k in names]
-        g_list = []
-        for i,k in enumerate(names):
-            rg = (i != len(names)-1)
-            g_list.append(gradvec(losses[k], self.params, retain_graph=rg))
-        G = torch.stack(g_list, dim=0)  # [T, P]
-        w = torch.tensor(w_list, device=device, dtype=G.dtype).view(T, 1)
-        g_raw = (w * G).sum(dim=0)      # [P]
-
-        mode = self.cfg.mode.lower()
-        stats: Dict[str, torch.Tensor] = {
-            "mode": torch.tensor({"sum":0,"pcgrad":1,"graddrop":2,"pgrs":3,"htdir":4}.get(mode, -1), device=device)
-        }
-
+        # vector of losses for B
+        losses_vec = torch.stack([losses[k].detach() for k in names], dim=0).to(dtype=G.dtype)
+        # -------------------- A: surgery / projection --------------------
         if mode == "sum":
-            g_final = g_raw
+            g_final, st = sum_grad(G, w_external)
+            stats.update(st)
 
         elif mode == "pcgrad":
-            Gm = self._pcgrad(G)          # [T,P]
-            g_final = (w * Gm).sum(dim=0)
+            g_final, st = pcgrad(G, w_external, eps=eps)
+            stats.update(st)
 
         elif mode == "graddrop":
-            g_final, st = self._graddrop(G, w)
+            g_final, st = graddrop(G, w_external, eps=eps)
             stats.update(st)
 
-        elif mode == "pgrs":
-            tau = float(self.cfg.tau)
-            # initialize Gpop if not initialized
-            if self.Gpop is None:
-                self.Gpop = g_raw.detach().clone()
-            Gprime, st = self._pgrs_projection_surgery(G, self.Gpop, tau=tau)
-            g_final = (w * Gprime).sum(dim=0)
-            self._update_gpop(g_final)
-
+        elif mode == "mgda":
+            # NOTE: MGDA learns alpha on simplex; external weights are not used inside the solver
+            g_final, st = mgda_min_norm(G, iters=self.cfg.mgda_iters, lr=self.cfg.mgda_lr, eps=eps)
             stats.update(st)
 
-        elif mode == "htdir":
-            g_norm = g_raw.norm() + eps
-            if g_norm.item() == 0.0:
-                g_final = g_raw
-            else:
-                v, st = self._sample_ht_direction(G, w)
-                g_final = g_norm * v
-                stats.update(st)
-
-        elif mode == "pgrs_lambda":
-            tau = float(self.cfg.tau)
-            # initialize Gpop if not initialized
-            if self.Gpop is None:
-                self.Gpop = g_raw
-            Gpop = self.Gpop
-
-            # 2) compute lambda
-            lam, conf, mean_g_norm = self._conf_lambda(G, Gpop)
-
-            # 3) projection surgery branch
-            Gprime, st_route = self._pgrs_projection_surgery(G, Gpop, tau=tau)
-            g_surgery = (w * Gprime).sum(dim=0)
-
-            # 4) fallback branch: PCGrad
-            Gpc = self._pcgrad(G)
-            g_pc = (w * Gpc).sum(dim=0)
-
-            # 5) mix on aggregated gradients (NOT per-task mix)
-            g_final = lam * g_surgery + (1.0 - lam) * g_pc
-            
-            Gpop = self._update_gpop(g_final)
-
-            stats.update(st_route)
-            stats.update({
-                "lambda": lam.detach(),
-                "conf": conf.detach(),
-                "mean_g_norm": mean_g_norm.detach(),
-                "Gpop_norm": (Gpop.norm() + eps).detach(),
-                "cos_surgery_pc": torch.dot(g_surgery, g_pc) / ((g_surgery.norm()+eps) * (g_pc.norm()+eps)),
-            })
-
-        elif mode == "pgrs_lpf1":
-            """
-            Single-loss low-pass reference (EMA) + global projection surgery.
-
-            - Pick ONE loss (gpop_key) to generate the reference input x_t.
-            - Update Gpop with EMA(x_t) ONLY (this is the low-pass filter).
-            - Apply projection surgery to ALL task gradients using the OLD Gpop.
-            - Update happens at the END.
-            """
-            tau = float(self.cfg.tau)
-            eps_ = float(self.cfg.eps)
-
-            if gpop_key is None:
-                raise ValueError("gpop_key is required for pgrs_lpf1 mode")
-            if gpop_key not in losses:
-                raise ValueError(f"gpop_key='{gpop_key}' not found in losses keys={list(losses.keys())}")
-            idx = names.index(gpop_key)
-
-            # x_t: the ONLY signal that goes into EMA low-pass filter
-            # choose raw grad of that ONE loss (optionally weighted)
-            x = (w[idx] * G[idx]) if gpop_use_weight else G[idx]  # [P]
-
-            # init Gpop (filter state)
-            if self.Gpop is None:
-                self.Gpop = x.detach().clone()
-
-            Gpop = self.Gpop
-
-            # global surgery uses the OLD Gpop
-            Gprime, st = self._pgrs_projection_surgery(G, Gpop, tau=tau)
-            g_final = (w * Gprime).sum(dim=0)
-
-            # update low-pass filter state at END
-            Gpop = self._update_gpop(x)
-
+        elif mode == "cagrad":
+            g_final, st = cagrad(
+                G, w_external,
+                alpha=self.cfg.cagrad_alpha,
+                iters=self.cfg.cagrad_iters,
+                lr=self.cfg.cagrad_lr,
+                eps=eps,
+            )
             stats.update(st)
-            stats.update({
-                "gpop_key_idx": torch.tensor(idx, device=device, dtype=torch.long),
-                "lpf_in_norm": (x.norm() + eps_).detach(),
-                "Gpop_norm": (Gpop.norm() + eps_).detach(),
-            })
+
+        # -------------------- B: weighting / scalarization --------------------
+        elif mode == "dwa":
+            # DWA needs L(k-1)/L(k-2). We keep 2-step history.
+            prev = self._prev_losses_2
+            w_task, st = dwa_weights(losses_vec, prev_losses_vec=prev, Ttemp=self.cfg.dwa_T, eps=eps)
+            g_final = apply_weighting_then_sum(G, w_task)  # ignores external weights by design
+            stats.update(st)
+            stats.update({"w_task_max": w_task.max(), "w_task_min": w_task.min()})
+
+        elif mode == "gradnorm":
+            if self._init_losses is None:
+                self._init_losses = losses_vec.detach().clone().clamp_min(eps)
+            w_task, st = gradnorm_weights(
+                G, losses_vec,
+                init_losses_vec=self._init_losses,
+                alpha=self.cfg.gradnorm_alpha,
+                eps=eps,
+            )
+            g_final = apply_weighting_then_sum(G, w_task)
+            stats.update(st)
+            stats.update({"w_task_max": w_task.max(), "w_task_min": w_task.min()})
+
+        elif mode == "uw_heuristic":
+            w_task, st, self._uw_state = uw_heuristic_weights(
+                losses_vec, beta=self.cfg.uw_beta, state=self._uw_state, eps=eps
+            )
+            g_final = apply_weighting_then_sum(G, w_task)
+            stats.update(st)
+            stats.update({"w_task_max": w_task.max(), "w_task_min": w_task.min()})
+
+        # -------------------- C: game / Pareto --------------------
+        elif mode == "nash_mtl":
+            g_final, st = nash_mtl(G, iters=self.cfg.nash_iters, lr=self.cfg.nash_lr, eps=eps)
+            stats.update(st)
         
-        elif mode == "pgrs_stage":
-            tau = float(self.cfg.tau)
-
-            # init Gpop with raw global gradient
-            if self.Gpop is None:
-                self.Gpop = g_raw.detach().clone()
-
-            # stage decision
-            loss_sw = float(getattr(self.cfg, "loss_switch", 10.0))
-            loss_hi = loss_sw * 1.1
-            loss_val = float(self.overall_loss_raw.item())
-
-            if not self._is_late and loss_val < loss_sw:
-                self._is_late = True
-            elif self._is_late and loss_val > loss_hi:
-                self._is_late = False
-            late = self._is_late
-
-            if late:
-                # late-stage: degenerate to "instant surgery projection"
-                # (no EMA reference, no lag)
-                Gm = self._pcgrad(G)          # [T,P]
-                g_final = (w * Gm).sum(dim=0)
-
-                # keep Gpop tracking raw gradient (optional but recommended)
-                # avoids stale Gpop if you ever switch back or for logging
-                self._update_gpop(g_raw)
-
-                stats.update({
-                    "late_stage": torch.tensor(1.0, device=device, dtype=G.dtype),
-                    "loss_switch": torch.tensor(loss_sw, device=device, dtype=G.dtype),
-                    "pgrs_stage_late_pcgrad": torch.tensor(1.0, device=device, dtype=G.dtype),
-                })
-
-            else:
-                # early-stage: normal PGRS surgery w/ EMA reference (OLD Gpop)
-                Gpop = self.Gpop
-                Gprime, st = self._pgrs_projection_surgery(G, Gpop, tau=tau)
-                g_final = (w * Gprime).sum(dim=0)
-
-                # IMPORTANT FIX: update EMA with RAW (not g_final) to avoid self-locking
-                self._update_gpop(g_raw)
-
-                stats.update(st)
-                stats.update({
-                    "late_stage": torch.tensor(0.0, device=device, dtype=G.dtype),
-                    "loss_switch": torch.tensor(loss_sw, device=device, dtype=G.dtype),
-                    "pgrs_stage_late_pcgrad": torch.tensor(0.0, device=device, dtype=G.dtype),
-                })
-          
-        elif mode == "pgrs_common_gate":
-            """
-            No surgery.
-
-            - Use plain summed gradient for parameter update: g_final = g_raw.
-            - Maintain ONLY Gpop_common on common params.
-            - Update Gpop_common only when common-subspace rho has NO negatives.
-            """
-            cmask = self._common_mask(device=G.device)  # [P] bool
-
-            # common subspace grads
-            Gc = G[:, cmask]                      # [T, Pc]
-            g_raw_c = (w * Gc).sum(dim=0)         # [Pc]
-
-            # init Gpop_common
-            if self.Gpop_common is None:
-                self.Gpop_common = g_raw_c.detach().clone()
-
-            # rho in common subspace
-            rho_c = self._rho(Gc, self.Gpop_common)  # [T]
-            # alignment signal (dot, not cosine)
-            align = (Gc @ self.Gpop_common).detach()  # [T]
-            rho_thr = g_raw_c.new_tensor(float(self.cfg.common_gate_rho_thr))
-            # thr = g_raw_c.new_tensor(1e-12)
-            # can_update = (rho_c.min() >= rho_thr) & (g_raw_c.norm() > thr)
-            can_update = (rho_c.min() >= rho_thr)
-
-            # parameter update uses raw full gradient (no surgery)
-            g_final = g_raw.clone()
-            if not can_update.item():
-                g_final[cmask] = 0.0
-
-            # gated update of Gpop_common (use RAW common grad to avoid self-locking)
-            if can_update.item():
-                self._update_gpop_common(g_raw_c)
-                
-            beta = getattr(self, "corr_beta", 0.99)
-            for i, k in enumerate(names):
-                li = losses[k].detach()
-                prev = self._prev_loss.get(k, None)
-                if prev is None:
-                    dli = torch.zeros_like(li)
-                else:
-                    dli = (li - prev)
-                self._prev_loss[k] = li
-
-                # corr(Δloss, align)
-                ci = self._ema_corr_update(f"dloss_align/{k}", dli, align[i], beta=beta, eps=eps)
-                stats[f"corr_dloss_align/{k}"] = ci.detach()
-            
-            # ---- NEW: pairwise cosine between task grads in COMMON subspace ----
-            Gc_norm = Gc.norm(dim=1) + eps                     # [T]
-            Gc_unit = Gc / Gc_norm[:, None]                    # [T, Pc]
-            cos_tt = Gc_unit @ Gc_unit.T                       # [T, T]  pairwise cosine
-
-            # take upper triangle (exclude diagonal) for summary stats
-            triu = torch.triu(torch.ones_like(cos_tt, dtype=torch.bool), diagonal=1)
-            cos_vals = cos_tt[triu]                            # [T*(T-1)/2]
-
-            # conflict fraction: negative cosine among task pairs
-            stats.update({
-                "cos_tt_mean": cos_vals.mean().detach() if cos_vals.numel() else cos_tt.new_tensor(0.0),
-                "cos_tt_min":  cos_vals.min().detach()  if cos_vals.numel() else cos_tt.new_tensor(0.0),
-                "cos_tt_neg_frac": (cos_vals < 0).float().mean().detach() if cos_vals.numel() else cos_tt.new_tensor(0.0),
-            })
-
-            # ---- NEW: cosine of each task grad vs common summed grad (g_raw_c) ----
-            g_raw_c_norm = g_raw_c.norm() + eps
-            cos_to_rawc = (Gc @ g_raw_c) / (Gc_norm * g_raw_c_norm)  # [T]
-            stats.update({
-                "cos_to_rawc_mean": cos_to_rawc.mean().detach(),
-                "cos_to_rawc_min":  cos_to_rawc.min().detach(),
-                "cos_to_rawc_neg_frac": (cos_to_rawc < 0).float().mean().detach(),
-            })
-
-            stats.update({
-                "rho_c_mean": rho_c.mean().detach(),
-                "rho_c_min": rho_c.min().detach(),
-                "rho_c_max": rho_c.max().detach(),
-                "align_mean": align.mean().detach(),
-                "align_min": align.min().detach(),
-                "align_neg_frac": (align < 0).float().mean().detach(),
-                "rho_c_neg_frac": (rho_c < 0).float().mean().detach(),
-                "gpop_common_updated": can_update.float().detach(),
-                "Gpop_common_norm": (self.Gpop_common.norm() + eps).detach(),
-                "common_frac_params": cmask.float().mean().detach(),
-                "rho_c_gate_thr": rho_thr.detach(),
-            })
- 
+        # ---- optional gpop common gate / supervision ----
         else:
             raise ValueError(f"Unknown mode: {self.cfg.mode}")
+        
+        if self.gpop is not None:
+            stats.update(self.gpop.monitor(G=G, g_raw=g_raw, g_final=g_final, names=names))
 
-        # commit grads
+        # ===== conflict logs (final, after aggregation) =====
+        with torch.no_grad():
+            dot_t_final = (G @ g_final)  # [T]
+            viol_frac = (dot_t_final < 0).float().mean()
+
+            # normalized projection strength (helps see which task is sacrificed)
+            g_t_norm = G.norm(dim=1) + eps
+            proj_strength = dot_t_final / g_t_norm  # [T]
+
+            stats.update({
+                "viol_frac": viol_frac,
+                "dot_final_min": dot_t_final.min(),
+                "dot_final_mean": dot_t_final.mean(),
+            })
+
+            # per-task logs with stable keys
+            for i, k in enumerate(names):
+                stats[f"g_t_norm/{k}"] = g_t_norm[i]
+                stats[f"dot_final/{k}"] = dot_t_final[i]
+                stats[f"proj_final_over_norm/{k}"] = proj_strength[i]
+                
+        # -------------------- write back grads --------------------
         grads_final = unflatten(g_final.detach(), self.params)
         for p, g in zip(self.params, grads_final):
             p.grad = g
-            
-        #  use can_update when mode is pgrs_common_gate and not update Gpop_common
-        # if mode == "pgrs_common_gate" and (not can_update.item()):
-        #     for p in self.common_params:
-        #         p.grad = None
 
-        # diagnostics
+        # -------------------- update B states --------------------
         with torch.no_grad():
+            # shift history for DWA
+            self._prev_losses_2 = self._prev_losses_1
+            self._prev_losses_1 = losses_vec.detach().clone()
+
             raw_n = g_raw.norm() + eps
             fin_n = g_final.norm() + eps
             self.shrink_ratio = fin_n / raw_n
@@ -705,7 +346,9 @@ class GradAggregator:
             "overall_loss_raw": self.overall_loss_raw.detach(),
             "shrink_ratio": self.shrink_ratio.detach(),
             "cos_raw_final": self.cos_raw_final.detach(),
+            "g_raw_norm": g_raw.detach().norm(),
+            "g_final_norm": g_final.detach().norm(),
         })
-        self.last_stats = {k: (v.detach() if torch.is_tensor(v) else torch.tensor(v, device=device))
-                           for k, v in stats.items()}
+
+        self.last_stats = {k: (v.detach() if torch.is_tensor(v) else torch.tensor(v, device=device)) for k, v in stats.items()}
         return self.last_stats

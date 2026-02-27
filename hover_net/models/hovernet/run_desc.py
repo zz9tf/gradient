@@ -92,9 +92,7 @@ def train_step(batch_data, run_info):
     gpop_use_weight = extra.get("grad_gpop_use_weight", True)
     stats = grad_agg.backward(
         loss_branch,
-        weights=None,
-        gpop_key=gpop_key,
-        gpop_use_weight=gpop_use_weight,
+        weights=None
     )
     optimizer.step()
 

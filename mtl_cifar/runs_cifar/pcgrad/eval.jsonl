@@ -1,0 +1,4 @@
+{"t": 153.40075516700745, "epoch": 0, "mode": "pcgrad", "acc_cls": 0.5966, "lr": 0.1}
+{"t": 308.1341028213501, "epoch": 1, "mode": "pcgrad", "acc_cls": 0.6948, "lr": 0.1}
+{"t": 462.80247688293457, "epoch": 2, "mode": "pcgrad", "acc_cls": 0.7726, "lr": 0.1}
+{"t": 621.0521996021271, "epoch": 3, "mode": "pcgrad", "acc_cls": 0.8103, "lr": 0.1}

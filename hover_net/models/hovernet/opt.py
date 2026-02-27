@@ -35,10 +35,11 @@ def get_config(nr_type, mode):
                             freeze=False, mode=mode
                         ),
                         "optimizer": [
-                            optim.Adam,
+                            # optim.Adam,
+                            optim.SGD,
                             {  # should match keyword for parameters within the optimizer
                                 "lr": 1.0e-4,  # initial learning rate,
-                                "betas": (0.9, 0.999),
+                                # "betas": (0.9, 0.999),
                             },
                         ],
                         # learning rate scheduler
@@ -74,6 +75,7 @@ def get_config(nr_type, mode):
             #             ),
             #             "optimizer": [
             #                 optim.Adam,
+            #                 optim.SGD,
             #                 {  # should match keyword for parameters within the optimizer
             #                     "lr": 1.0e-4,  # initial learning rate,
             #                     "betas": (0.9, 0.999),

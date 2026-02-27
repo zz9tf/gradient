@@ -5,10 +5,7 @@ Main HoVer-Net training script.
 Usage:
   run_train.py [--gpu=<id>] [--view=<dset>] [--resume=<path>]
     [--batch-train=<n>] [--batch-valid=<n>]
-    [--grad-mode=<m>] [--grad-beta=<f>] [--grad-tau=<f>] [--grad-eps=<f>]
-    [--grad-gpop-key=<key>] [--grad-gpop-use-weight=<0|1>]
-    [--grad-dir-beta=<f>] [--grad-dir-k=<f>] [--grad-dir-reject-max=<n>]
-    [--grad-loss-switch=<f>] [--grad-common-gate-rho-thr=<f>]
+    [--grad-mode=<m>] [--grad-eps=<f>] [--grad-common-gate-rho-thr=<f>]
   run_train.py (-h | --help)
   run_train.py --version
 
@@ -20,17 +17,9 @@ Options:
   --resume=<path>         Resume training from this log dir (same grad overrides; set nr_epochs in opt to target total epochs).
   --batch-train=<n>       Batch size for training (per GPU). Overrides phase config.
   --batch-valid=<n>       Batch size for validation and test (per GPU). Overrides phase config.
-  --grad-mode=<m>         Gradient aggregation mode: sum|pcgrad|graddrop|pgrs|pgrs_lambda|pgrs_lpf1|pgrs_stage|pgrs_common_gate|htdir (overrides config).
-  --grad-beta=<f>         PGRS EMA beta, e.g. 0.999 (overrides config).
-  --grad-tau=<f>          PGRS alignment threshold, e.g. 0.2 (overrides config).
-  --grad-eps=<f>          Epsilon for gradient aggregation (overrides config).
-  --grad-gpop-key=<key>   For pgrs_lpf1: loss key for LPF reference (e.g. np). Overrides config.
-  --grad-gpop-use-weight=<0|1>  For pgrs_lpf1: use weight for reference loss, 1=yes [default: 1].
-  --grad-dir-beta=<f>     htdir concentration (>0), e.g. 5.0 (overrides config).
-  --grad-dir-k=<f>        htdir tail heaviness (>0), e.g. 2.0 (overrides config).
-  --grad-dir-reject-max=<n>  htdir max rejection steps, e.g. 64 (overrides config).
-  --grad-loss-switch=<f>  For pgrs_stage: loss threshold to switch to late stage (overrides config).
-  --grad-common-gate-rho-thr=<f>  For pgrs_common_gate: rho gate threshold in [-1,1] (overrides config).
+  --grad-mode=<m>         Gradient aggregation mode: sum|pcgrad|graddrop|mgda|cagrad|dwa|gradnorm|uw_heuristic|nash_mtl (overrides config).
+  --grad-eps=<f>          Epsilon for gradient aggregation (GradAggConfig.eps override).
+  --grad-common-gate-rho-thr=<f>  Enable Gpop common gate and set rho_thr in [-1,1] (GradAggConfig.gpop_enabled=True, gpop_rho_thr override).
 """
 
 import cv2
@@ -104,31 +93,16 @@ def _parse_grad_overrides(args):
         args: dict from docopt (keys --grad-mode, --grad-beta, etc.).
 
     Returns:
-        dict: keys mode, beta, tau, eps, gpop_key, gpop_use_weight, dir_beta, dir_k, dir_reject_max, loss_switch, common_gate_rho_thr; only present if given on CLI.
+        dict: keys compatible with GradAggConfig (mode, eps, gpop_enabled, gpop_rho_thr); only present if given on CLI.
     """
     overrides = {}
     if args.get("--grad-mode"):
         overrides["mode"] = args["--grad-mode"]
-    if args.get("--grad-beta"):
-        overrides["beta"] = float(args["--grad-beta"])
-    if args.get("--grad-tau"):
-        overrides["tau"] = float(args["--grad-tau"])
+    if args.get("--grad-common-gate-rho-thr"):
+        overrides["gpop_enabled"] = True
+        overrides["gpop_rho_thr"] = float(args["--grad-common-gate-rho-thr"])
     if args.get("--grad-eps"):
         overrides["eps"] = float(args["--grad-eps"])
-    if args.get("--grad-gpop-key"):
-        overrides["gpop_key"] = args["--grad-gpop-key"]
-    if args.get("--grad-gpop-use-weight") is not None:
-        overrides["gpop_use_weight"] = bool(int(args["--grad-gpop-use-weight"]))
-    if args.get("--grad-dir-beta"):
-        overrides["dir_beta"] = float(args["--grad-dir-beta"])
-    if args.get("--grad-dir-k"):
-        overrides["dir_k"] = float(args["--grad-dir-k"])
-    if args.get("--grad-dir-reject-max"):
-        overrides["dir_reject_max"] = int(args["--grad-dir-reject-max"])
-    if args.get("--grad-loss-switch"):
-        overrides["loss_switch"] = float(args["--grad-loss-switch"])
-    if args.get("--grad-common-gate-rho-thr"):
-        overrides["common_gate_rho_thr"] = float(args["--grad-common-gate-rho-thr"])
     return overrides
 
 
@@ -137,7 +111,7 @@ def _grad_overrides_to_log_suffix(grad_overrides):
     Build a log subdir suffix from gradient overrides so results go to a different path.
 
     Args:
-        grad_overrides: dict with keys mode, beta, tau, eps, gpop_key, gpop_use_weight, dir_beta, dir_k, dir_reject_max, loss_switch, common_gate_rho_thr (any subset).
+        grad_overrides: dict with keys mode, eps, gpop_enabled, gpop_rho_thr (any subset).
 
     Returns:
         str: e.g. "grad_pgrs" or "grad_pgrs_lpf1_gknp", or "" if empty.
@@ -145,26 +119,12 @@ def _grad_overrides_to_log_suffix(grad_overrides):
     if not grad_overrides:
         return ""
     parts = ["grad", grad_overrides.get("mode", "sum")]
-    if "beta" in grad_overrides:
-        parts.append("b%g" % grad_overrides["beta"])
-    if "tau" in grad_overrides:
-        parts.append("t%g" % grad_overrides["tau"])
     if "eps" in grad_overrides:
         parts.append("e%g" % grad_overrides["eps"])
-    if "gpop_key" in grad_overrides:
-        parts.append("gk%s" % grad_overrides["gpop_key"])
-    if "gpop_use_weight" in grad_overrides:
-        parts.append("gw%d" % int(grad_overrides["gpop_use_weight"]))
-    if "dir_beta" in grad_overrides:
-        parts.append("db%g" % grad_overrides["dir_beta"])
-    if "dir_k" in grad_overrides:
-        parts.append("dk%g" % grad_overrides["dir_k"])
-    if "dir_reject_max" in grad_overrides:
-        parts.append("dr%d" % grad_overrides["dir_reject_max"])
-    if "loss_switch" in grad_overrides:
-        parts.append("ls%g" % grad_overrides["loss_switch"])
-    if "common_gate_rho_thr" in grad_overrides:
-        parts.append("cgr%g" % grad_overrides["common_gate_rho_thr"])
+    if grad_overrides.get("gpop_enabled"):
+        parts.append("gpop")
+    if "gpop_rho_thr" in grad_overrides:
+        parts.append("rho%g" % grad_overrides["gpop_rho_thr"])
     return "_".join(parts)
 
 
@@ -194,7 +154,7 @@ class TrainManager(Config):
         """
         Args:
             grad_overrides: Optional dict to override GradAggConfig
-                (mode, beta, tau, eps, dir_beta, dir_k, dir_reject_max, loss_switch, common_gate_rho_thr).
+                (mode, eps, gpop_enabled, gpop_rho_thr, and other GradAggConfig fields).
             resume_path: If set, resume training from this log dir (same grad overrides; set nr_epochs in opt to target total).
             batch_overrides: Optional dict to override batch_size, e.g. {"train": 16, "valid": 8}.
         """
@@ -424,21 +384,12 @@ class TrainManager(Config):
             scheduler = net_info["lr_scheduler"](optimizer)
             extra_info = dict(net_info["extra_info"])
             grad_mode = self.grad_overrides.get("mode", extra_info["grad_mode"])
-            grad_cfg = {**extra_info["grad_cfg"]}
-            for k in ("beta", "tau", "eps", "dir_beta", "dir_k", "dir_reject_max", "loss_switch", "common_gate_rho_thr"):
-                if k in self.grad_overrides:
-                    grad_cfg[k] = self.grad_overrides[k]
-            # pgrs_lpf1: gpop_key and gpop_use_weight (from config or CLI)
-            if "gpop_key" in self.grad_overrides:
-                extra_info["grad_gpop_key"] = self.grad_overrides["gpop_key"]
-            elif "grad_gpop_key" in extra_info:
-                pass  # keep from config
-            elif grad_mode == "pgrs_lpf1":
-                extra_info["grad_gpop_key"] = "np"  # default reference loss key
-            if "gpop_use_weight" in self.grad_overrides:
-                extra_info["grad_gpop_use_weight"] = self.grad_overrides["gpop_use_weight"]
-            elif "grad_gpop_use_weight" not in extra_info and grad_mode == "pgrs_lpf1":
-                extra_info["grad_gpop_use_weight"] = True
+            # start from config grad_cfg and apply any CLI overrides except mode
+            grad_cfg = dict(extra_info.get("grad_cfg", {}))
+            for k, v in self.grad_overrides.items():
+                if k == "mode":
+                    continue
+                grad_cfg[k] = v
             # Store effective config so logs/checkpoints record what is actually used
             extra_info["grad_mode"] = grad_mode
             extra_info["grad_cfg"] = grad_cfg
