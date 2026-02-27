@@ -211,6 +211,7 @@ __marimo__/
 # -----------------------------------------------------------------------------
 # Training logs and checkpoints
 logs/
+mtl_cifar/runs_cifar/
 *.tar
 *.npz
 events.out.tfevents.*
