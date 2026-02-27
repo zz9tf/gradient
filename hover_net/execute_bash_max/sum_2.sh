@@ -6,4 +6,4 @@ source /home/zz/miniconda3/etc/profile.d/conda.sh
 conda activate hovernet_h100
 cd /home/zz/zheng/gradient/hover_net
 
-python run_train.py --gpu "$GPU_ID" --grad-mode sum --batch-train 2
+python run_train.py --gpu "$GPU_ID" --grad-mode sum --batch-train 2 --resume '/home/zz/zheng/gradient/hover_net/logs/grad_sum_gw1_bt_2'

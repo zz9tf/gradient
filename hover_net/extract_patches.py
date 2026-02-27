@@ -18,7 +18,7 @@ if __name__ == "__main__":
 
     win_size = [256, 256]
     step_size = [164, 164]
-    extract_type = "valid"
+    extract_type = "mirror"
     print(f"MoNuSAC dataset extraction mode: {extract_type}")
 
     dataset_name = "monusac"
@@ -26,7 +26,7 @@ if __name__ == "__main__":
     xtractor = PatchExtractor(win_size, step_size)
 
     # Your data root directory
-    data_root = Path("/home/zheng/zheng/gradient/MoNuSAC")
+    data_root = Path("/home/zz/zheng/gradient/MoNuSAC")
 
     save_root = Path("dataset/monusac")
 
