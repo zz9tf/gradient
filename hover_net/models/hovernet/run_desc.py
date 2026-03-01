@@ -10,7 +10,10 @@ from collections import OrderedDict
 
 ####
 def train_step(batch_data, run_info):
-    # TODO: synchronize the attach protocol
+    """
+    One training step: forward, per-branch losses, GradAggregator.backward, optimizer step.
+    Records all scalar metrics from grad_agg.backward() into EMA for stats.json and tensorboard.
+    """
     run_info, state_info = run_info
     loss_func_dict = {
         "bce": xentropy_loss,
@@ -86,96 +89,19 @@ def train_step(batch_data, run_info):
         track_value(f"{branch_name}_loss", branch_loss.detach().item())
 
     optimizer.zero_grad(set_to_none=True)
-    # pgrs_lpf1 requires gpop_key (and optionally gpop_use_weight) from extra_info
-    extra = run_info["net"]["extra_info"]
-    gpop_key = extra.get("grad_gpop_key")
-    gpop_use_weight = extra.get("grad_gpop_use_weight", True)
-    stats = grad_agg.backward(
-        loss_branch,
-        weights=None
-    )
+    stats = grad_agg.backward(loss_branch, weights=None)
     optimizer.step()
 
-    track_value("overall_loss", total_loss.detach().item())   # 真实总loss（全参数）
+    track_value("overall_loss", total_loss.detach().item())
 
-    # --- strategy metrics: op_* for HybridGradAggregator (OP-subspace), else GradAggregator (cos_raw_final, shrink_ratio) ---
-    cos_raw = getattr(grad_agg, "op_cos_raw_final", None) or getattr(grad_agg, "cos_raw_final", None)
-    if cos_raw is not None:
-        track_value("cos_raw_final", cos_raw.item())
-    shrink = getattr(grad_agg, "op_shrink_ratio", None) or getattr(grad_agg, "shrink_ratio", None)
-    if shrink is not None:
-        track_value("shrink_ratio", shrink.item())
-
-    # (optional) PGRS-family stats (pgrs, pgrs_lambda, pgrs_lpf1, pgrs_stage, pgrs_common_gate)
-    if hasattr(grad_agg, "last_stats") and grad_agg.last_stats:
-        ls = grad_agg.last_stats
-        # base pgrs metrics (if present)
-        if "kept_frac" in ls:
-            track_value("pgrs/kept_frac", ls["kept_frac"].item())
-        if "rho_mean" in ls:
-            track_value("pgrs/rho_mean",  ls["rho_mean"].item())
-        if "rho_min" in ls:
-            track_value("pgrs/rho_min",  ls["rho_min"].item())
-        if "rho_max" in ls:
-            track_value("pgrs/rho_max",  ls["rho_max"].item())
-        if "drop_frac" in ls:
-            track_value("pgrs/drop_frac", ls["drop_frac"].item())
-        if "surgery_frac" in ls:
-            track_value("pgrs/surgery_frac", ls["surgery_frac"].item())
-        # fast-update stats (when use_fast_update=True)
-        for key in ("fast_S", "fast_beta", "fast_e_norm", "fast_m_norm", "fast_v"):
-            if key in ls:
-                track_value(f"pgrs/{key}", ls[key].item())
-        # pgrs_lambda specific: lambda, conf, mean_g_norm, Gpop_norm, cos_route_pc
-        for key in ("lambda", "conf", "mean_g_norm", "Gpop_norm", "cos_route_pc"):
-            if key in ls:
-                track_value(f"pgrs/{key}", ls[key].item())
-        # pgrs_lpf1 specific: gpop_key_idx, lpf_in_norm, Gpop_norm
-        for key in ("gpop_key_idx", "lpf_in_norm", "Gpop_norm"):
-            if key in ls:
-                track_value(f"pgrs/{key}", ls[key].item())
-        # pgrs_stage specific flags
-        for key in ("late_stage", "loss_switch", "pgrs_stage_late_pcgrad"):
-            if key in ls:
-                track_value(f"pgrs_stage/{key}", ls[key].item())
-        # pgrs_common_gate specific: common-subspace alignment and gating stats
-        for key in (
-            "rho_c_mean",
-            "rho_c_min",
-            "rho_c_max",
-            "align_mean",
-            "align_min",
-            "align_neg_frac",
-            "rho_c_neg_frac",
-            "gpop_common_updated",
-            "Gpop_common_norm",
-            "common_frac_params",
-            "rho_c_gate_thr",
-            "cos_tt_mean",
-            "cos_tt_min",
-            "cos_tt_neg_frac",
-            "cos_to_rawc_mean",
-            "cos_to_rawc_min",
-            "cos_to_rawc_neg_frac",
-        ):
-            if key in ls:
-                track_value(f"pgrs_common_gate/{key}", ls[key].item())
-        # pgrs_common_gate correlations: corr_dloss_align/<branch>, corr_dloss_rho/<branch>
-        for name, val in ls.items():
-            if name.startswith("corr_dloss_align/"):
-                suffix = name.split("/", 1)[1].replace("/", "_")
-                track_value(f"pgrs_common_gate/corr_dloss_align_{suffix}", val.item())
-            if name.startswith("corr_dloss_rho/"):
-                suffix = name.split("/", 1)[1].replace("/", "_")
-                track_value(f"pgrs_common_gate/corr_dloss_rho_{suffix}", val.item())
-
-    # (optional) ht_iters/ht_acc only exist for htdir mode
-    if hasattr(grad_agg, "last_stats") and ("ht_iters" in grad_agg.last_stats):
-        track_value("htdir/ht_iters", grad_agg.last_stats["ht_iters"].item())
-        if "ht_acc" in grad_agg.last_stats:
-            track_value("htdir/ht_acc", grad_agg.last_stats["ht_acc"].item())
-
-    # torch.set_printoptions(precision=10)
+    # Record all scalar metrics from the new GradAggregator wrapper (stats.json + tensorboard).
+    # Keys with "/" are sanitized to "_" for JSON/logging (e.g. g_t_norm/np -> grad_g_t_norm_np).
+    for key, val in stats.items():
+        if torch.is_tensor(val) and val.numel() == 1:
+            log_key = "grad_" + key.replace("/", "_")
+            track_value(log_key, val.detach().item())
+        elif isinstance(val, (int, float)):
+            track_value("grad_" + key.replace("/", "_"), float(val))
 
     ####
 

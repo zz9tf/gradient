@@ -69,6 +69,41 @@ def _print_model_param_blocks(model: torch.nn.Module) -> None:
     print()
 
 
+def _convert_grad_stats_to_dict(stats: Dict) -> Dict[str, float]:
+    """
+    Generic helper to convert GradAggregator stats dict to loggable dict.
+    
+    This function handles the standard output format from grad_wrapper:
+    - Converts tensor values to Python floats
+    - Sanitizes keys with "/" to "_" for JSON/wandb compatibility
+    - Filters out non-scalar values
+    
+    Args:
+        stats: Dictionary returned by GradAggregator.backward()
+        
+    Returns:
+        Dictionary with sanitized keys and scalar float values
+        
+    Example:
+        >>> stats = {"g_t_norm/np": torch.tensor(1.5), "mode_id": 0}
+        >>> _convert_grad_stats_to_dict(stats)
+        {"g_t_norm_np": 1.5, "mode_id": 0.0}
+    """
+    result = {}
+    for k, v in stats.items():
+        # Sanitize key: replace "/" with "_" for JSON/wandb compatibility
+        sanitized_key = k.replace("/", "_")
+        
+        # Convert value to float if it's a scalar
+        if torch.is_tensor(v) and v.numel() == 1:
+            result[sanitized_key] = float(v.detach().item())
+        elif isinstance(v, (int, float)):
+            result[sanitized_key] = float(v)
+        # Skip non-scalar tensors or other types
+    
+    return result
+
+
 def _make_common_param_filter(common_prefixes: Tuple[str, ...]):
     """Build common_param_filter callable for GradAggregator.
 
@@ -403,10 +438,8 @@ class CellViTTrainer(BaseTrainer):
             if branch_losses:
                 stats = self.grad_aggregator.backward(branch_losses)
                 if stats:
-                    grad_agg_stats = {
-                        k: v.item() if torch.is_tensor(v) else float(v)
-                        for k, v in stats.items()
-                    }
+                    # Generic logging: convert all stats from GradAggregator
+                    grad_agg_stats = _convert_grad_stats_to_dict(stats)
 
             if (
                 ((batch_idx + 1) % self.accum_iter == 0)

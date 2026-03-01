@@ -386,6 +386,7 @@ class TrainManager(Config):
             grad_mode = self.grad_overrides.get("mode", extra_info["grad_mode"])
             # start from config grad_cfg and apply any CLI overrides except mode
             grad_cfg = dict(extra_info.get("grad_cfg", {}))
+            grad_cfg["gpop_enabled"] = True
             for k, v in self.grad_overrides.items():
                 if k == "mode":
                     continue

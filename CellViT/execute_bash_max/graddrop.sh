@@ -6,4 +6,4 @@ source /home/zz/miniconda3/etc/profile.d/conda.sh
 conda activate cellvit
 cd /home/zz/zheng/gradient/CellViT
 
-python cell_segmentation/run_cellvit.py --config execute_bash/train_config_common_gate.yaml --gpu $GPU_ID
+python cell_segmentation/run_cellvit.py --config execute_bash_max/train_config_graddrop.yaml --gpu $GPU_ID

@@ -6,8 +6,8 @@ logging:
   notes: ""
   log_comment: monusac_run
   tags: []
-  wandb_dir: ~/zheng/gradient/CellViT/logs
-  log_dir: ~/zheng/gradient/CellViT/logs
+  wandb_dir: /home/zz/zheng/gradient/CellViT/logs
+  log_dir: /home/zz/zheng/gradient/CellViT/logs
   level: info
 
 random_seed: 19
@@ -15,11 +15,11 @@ gpu: 0
 
 data:
   dataset: monusac_patched
-  dataset_path: ~/zheng/gradient/hover_net/dataset/monusac
+  dataset_path: /home/zz/zheng/gradient/hover_net/dataset/monusac
   train_split: train
   val_split: valid
   patch_subdir: 256x256_164x164
-  num_nuclei_classes: 4
+  num_nuclei_classes: 5
   num_tissue_classes: 1
   input_shape: 256
 
@@ -95,4 +95,4 @@ eval_checkpoint: model_best.pth
 # Optional: multi-task gradient aggregation (gradient_wrapper must be in parent dir).
 # Uncomment to enable (modes: sum, pcgrad, graddrop, pgrs, htdir).
 grad_wrapper:
-  mode: pcgrad
+  mode: sum

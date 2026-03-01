@@ -83,10 +83,12 @@ class GradAggConfig:
     uw_beta: float = 0.9
     
     # ---- Gpop common gate (optional) ----
-    gpop_enabled: bool = False
+    gpop_enabled: bool = True
+    gpop_monitor: bool = True
+    gpop_policy: bool = False
     gpop_beta: float = 0.99
     gpop_rho_thr: float = 0.0
-    gpop_freeze_common_on_fail: bool = True
+    gpop_freeze_common_on_fail: bool = False
     gpop_sup_lambda: float = 0.0
     gpop_sup_mode: str = "pull_to_gpop"  # pull_to_gpop | proj_to_gpop
 
@@ -102,7 +104,8 @@ class GradAggConfig:
         }
         if self.gpop_enabled:
             GpopConfig(
-                enabled=True,
+                monitor=self.gpop_monitor,
+                policy=self.gpop_policy,
                 beta=self.gpop_beta,
                 rho_thr=self.gpop_rho_thr,
                 freeze_common_on_fail=self.gpop_freeze_common_on_fail,
@@ -135,7 +138,8 @@ class GradAggregator:
             if common_param_filter is None:
                 raise ValueError("gpop_enabled=True but common_param_filter is None")
             gpcfg = GpopConfig(
-                enabled=True,
+                monitor=self.cfg.gpop_monitor,
+                policy=self.cfg.gpop_policy,
                 beta=self.cfg.gpop_beta,
                 rho_thr=self.cfg.gpop_rho_thr,
                 freeze_common_on_fail=self.cfg.gpop_freeze_common_on_fail,
@@ -352,3 +356,17 @@ class GradAggregator:
 
         self.last_stats = {k: (v.detach() if torch.is_tensor(v) else torch.tensor(v, device=device)) for k, v in stats.items()}
         return self.last_stats
+
+    def state_dict(self) -> dict:
+        """State dict for checkpointing (e.g. Gpop common gate)."""
+        out: Dict = {}
+        if self.gpop is not None:
+            out["gpop"] = self.gpop.state_dict()
+        return out
+
+    def load_state_dict(self, st: dict, strict: bool = False) -> None:
+        """Restore state from checkpoint."""
+        if st is None:
+            return
+        if self.gpop is not None and "gpop" in st:
+            self.gpop.load_state_dict(st["gpop"])

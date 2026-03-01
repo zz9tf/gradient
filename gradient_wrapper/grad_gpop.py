@@ -12,7 +12,7 @@ class GpopConfig:
     # 默认不做策略（建议默认 False）
     policy: bool = False
 
-    beta: float = 0.999
+    beta: float = 0.99
     rho_thr: float = 0.0
     freeze_common_on_fail: bool = True
 
@@ -64,6 +64,13 @@ class GpopCommonGate:
 
         self.Gpop_common: Optional[torch.Tensor] = None  # [Pc]
 
+        # NEW: monitor-only state (does NOT affect training)
+        self._prev_g_raw_c: Optional[torch.Tensor] = None  # [Pc]
+        
+        # NEW: per-task monitor-only states in common space
+        self._prev_gt_c: Dict[str, torch.Tensor] = {}     # name -> [Pc]
+        self._gpop_task_c: Dict[str, torch.Tensor] = {}   # name -> EMA_t [Pc]
+
     def common_mask(self, device):
         return self._common_mask_cpu.to(device=device)
 
@@ -83,11 +90,6 @@ class GpopCommonGate:
             self.Gpop_common = beta * self.Gpop_common + (1.0 - beta) * g_raw_c.detach()
 
     @torch.no_grad()
-    def _ensure_gpop_init(self, g_raw_c: torch.Tensor):
-        if self.Gpop_common is None:
-            self.Gpop_common = g_raw_c.detach().clone()
-
-    @torch.no_grad()
     def monitor(
         self,
         G: torch.Tensor,        # [T,P]
@@ -96,7 +98,9 @@ class GpopCommonGate:
         names: Optional[List[str]] = None,       # optional task names for per-task keys
     ) -> Dict[str, torch.Tensor]:
         """
-        Pure logging: NEVER modifies gradients, NEVER EMA update (unless你想的话也可改).
+        Monitor-only logging:
+        - DOES update EMA reference (Gpop_common) for observation
+        - NEVER modifies gradients
         """
         if not bool(self.cfg.monitor):
             return {}
@@ -104,42 +108,124 @@ class GpopCommonGate:
         eps = float(self.cfg.eps)
         device = g_raw.device
         cmask = self.common_mask(device=device)
-        Gc = G[:, cmask]       # [T,Pc]
-        g_raw_c = g_raw[cmask] # [Pc]
+        Gc = G[:, cmask]
+        g_raw_c = g_raw[cmask]
 
-        # init reference so rho is defined
-        self._ensure_gpop_init(g_raw_c)
+        # 1) no gpop -> skip
+        if self.Gpop_common is None:
+            self._ema_update(g_raw_c)          # init
+            self._prev_g_raw_c = g_raw_c.detach().clone()
+            return {}
 
-        rho = self._rho(Gc, self.Gpop_common)  # [T]
+        # 2) use OLD gpop for metrics
+        gpop = self.Gpop_common
+        rho = self._rho(Gc, gpop)
 
-        # pairwise cos within common
+        # ---------------- NEW: switching / lag / dominance signals ----------------
+        # (A) time-correlation of raw common gradient
+        if self._prev_g_raw_c is None:
+            graw_cos_prev = g_raw_c.new_tensor(0.0)
+            prev_norm = g_raw_c.new_tensor(0.0)
+        else:
+            prev = self._prev_g_raw_c
+            graw_cos_prev = torch.dot(g_raw_c, prev) / ((g_raw_c.norm() + eps) * (prev.norm() + eps))
+            prev_norm = prev.norm()
+
+        # (B) lag: raw common vs gpop
+        gpop_cos_raw = torch.dot(g_raw_c, gpop) / ((g_raw_c.norm() + eps) * (gpop.norm() + eps))
+
+        # (C) dominance: per-task norm share in common
+        g_t_common_norm = Gc.norm(dim=1) + eps                  # [T]
+        share = g_t_common_norm / (g_t_common_norm.sum() + eps) # [T]
+
+        # (D) per-task alignment with current raw in common
+        g_raw_c_norm = g_raw_c.norm() + eps
+        cos_raw_common_each = (Gc @ g_raw_c) / (g_t_common_norm * g_raw_c_norm)  # [T]
+
+        # (E) dispersion of rho
+        rho_std = rho.std(unbiased=False) if rho.numel() > 1 else rho.new_tensor(0.0)
+        # -------------------------------------------------------------------------
+
+        # pairwise cos within common (task-task)
         gnorm = (Gc.norm(dim=1) + eps)  # [T]
         Gu = Gc / gnorm[:, None]
         cos_tt = Gu @ Gu.T
         triu = torch.triu(torch.ones_like(cos_tt, dtype=torch.bool), diagonal=1)
         cos_vals = cos_tt[triu]
 
-        # violation in common: does update hurt a task first-order?
+        # violation in common: does raw update hurt a task first-order?
         dot_raw = (Gc @ g_raw_c)  # [T]
         raw_viol = (dot_raw < 0).float().mean()
+        
+        # ---- NEW: per-task stability (requires names) ----
+        task_extra: Dict[str, torch.Tensor] = {}
+
+        if names is not None and len(names) == Gc.shape[0]:
+            beta = float(self.cfg.beta)
+
+            for i, k in enumerate(names):
+                gt_c = Gc[i]  # [Pc]
+
+                # (1) time-correlation: cos(gt_c(k), gt_c(k-1))
+                prev = self._prev_gt_c.get(k, None)
+                if prev is None:
+                    cos_prev = gt_c.new_tensor(0.0)
+                else:
+                    cos_prev = torch.dot(gt_c, prev) / ((gt_c.norm() + eps) * (prev.norm() + eps))
+                task_extra[f"gt_cos_prev_common/{k}"] = cos_prev
+                self._prev_gt_c[k] = gt_c.detach().clone()
+
+                # (2) per-task EMA reference in common: gpop_t
+                gpop_t = self._gpop_task_c.get(k, None)
+                if gpop_t is None:
+                    # init and skip cos for first time
+                    self._gpop_task_c[k] = gt_c.detach().clone()
+                    task_extra[f"gt_cos_gpop_t/{k}"] = gt_c.new_tensor(0.0)
+                    task_extra[f"gpop_t_norm/{k}"] = (gt_c.norm() + eps)
+                    task_extra[f"gpop_t_delta_over_norm/{k}"] = gt_c.new_tensor(0.0)
+                else:
+                    # cos(gt_c, gpop_t_old)
+                    cos_gpop_t = torch.dot(gt_c, gpop_t) / ((gt_c.norm() + eps) * (gpop_t.norm() + eps))
+                    task_extra[f"gt_cos_gpop_t/{k}"] = cos_gpop_t
+                    task_extra[f"gpop_t_norm/{k}"] = (gpop_t.norm() + eps)
+
+                    # update EMA_t at end (old->new) and log delta
+                    gpop_t_new = beta * gpop_t + (1.0 - beta) * gt_c.detach()
+                    delta = (gpop_t_new - gpop_t).norm()
+                    task_extra[f"gpop_t_delta_over_norm/{k}"] = delta / (gpop_t.norm() + eps)
+
+                    self._gpop_task_c[k] = gpop_t_new
 
         out: Dict[str, torch.Tensor] = {
             "gpop_monitor": g_raw.new_tensor(1.0),
             "common_frac_params": cmask.float().mean(),
 
+            # gpop alignment stats
             "gpop_rho_mean": rho.mean(),
             "gpop_rho_min": rho.min(),
+            "gpop_rho_std": rho_std,
 
+            # lag / switching
+            "graw_cos_prev_common": graw_cos_prev,
+            "gpop_cos_raw": gpop_cos_raw,
+            "g_raw_common_norm": g_raw_c.norm(),
+            "gpop_norm": (gpop.norm() + eps),
+
+            # task-task geometry in common
             "cos_tt_common_mean": cos_vals.mean() if cos_vals.numel() else cos_tt.new_tensor(0.0),
             "cos_tt_common_min":  cos_vals.min()  if cos_vals.numel() else cos_tt.new_tensor(0.0),
+            "cos_tt_common_neg_mean": cos_vals.mean() if cos_vals.numel() else cos_tt.new_tensor(0.0),
+            "cos_tt_common_p05": cos_vals.kthvalue(max(1, int(0.05 * cos_vals.numel()))).values,
+            "cos_tt_common_p10": cos_vals.kthvalue(max(1, int(0.10 * cos_vals.numel()))).values,
             "cos_tt_common_neg_frac": (cos_vals < 0).float().mean() if cos_vals.numel() else cos_tt.new_tensor(0.0),
 
+            # raw violation in common
             "raw_viol_frac_common": raw_viol,
             "dot_raw_common_min": dot_raw.min(),
             "dot_raw_common_mean": dot_raw.mean(),
 
-            "g_raw_common_norm": g_raw_c.norm(),
-            "gpop_norm": (self.Gpop_common.norm() + eps),
+            # (optional) debug
+            "graw_prev_common_norm": prev_norm,
         }
 
         if g_final is not None:
@@ -152,14 +238,21 @@ class GpopCommonGate:
                 "g_final_common_norm": g_final_c.norm(),
             })
 
-        # optional per-task stats (建议只开少量任务，否则 log 很大)
+        # optional per-task logs
         if names is not None and len(names) == rho.numel():
             for i, k in enumerate(names):
                 out[f"gpop_rho/{k}"] = rho[i]
                 out[f"dot_raw_common/{k}"] = dot_raw[i]
+                out[f"task_share_common/{k}"] = share[i]
+                out[f"cos_raw_common/{k}"] = cos_raw_common_each[i]
+        
+        out.update(task_extra)
+        # --- update EMA reference for logging ---
+        self._ema_update(g_raw_c)
+        self._prev_g_raw_c = g_raw_c.detach().clone()
 
         return {k: v.detach() for k, v in out.items()}
-
+    
     @torch.no_grad()
     def apply_policy(
         self,
@@ -176,10 +269,8 @@ class GpopCommonGate:
         cmask = self.common_mask(device=device)
         Gc = G[:, cmask]
         g_raw_c = g_raw[cmask]
-
-        self._ensure_gpop_init(g_raw_c)
-
-        rho = self._rho(Gc, self.Gpop_common)
+        Gpop_common = self.Gpop_common if self.Gpop_common is not None else g_raw_c.detach().clone()
+        rho = self._rho(Gc, Gpop_common)
         rho_thr = g_raw_c.new_tensor(float(self.cfg.rho_thr))
         can_update = (rho.min() >= rho_thr)
 
@@ -194,12 +285,14 @@ class GpopCommonGate:
         if float(self.cfg.sup_lambda) > 0.0:
             lam = g_raw_c.new_tensor(float(self.cfg.sup_lambda))
             if self.cfg.sup_mode == "pull_to_gpop":
-                g_new[cmask] = g_new[cmask] + lam * (self.Gpop_common / (self.Gpop_common.norm() + eps))
-            else:  # proj_to_gpop
+                g_new[cmask] = g_new[cmask] + lam * (Gpop_common / (Gpop_common.norm() + eps))
+            elif self.cfg.sup_mode == "proj_to_gpop":
                 gc = g_new[cmask]
-                dot = torch.dot(gc, self.Gpop_common)
-                if dot < 0:
-                    g_new[cmask] = gc - (dot / (self.Gpop_common.dot(self.Gpop_common) + eps)) * self.Gpop_common
+                dot = torch.dot(gc, Gpop_common)
+                if dot < 0.0:
+                    g_new[cmask] = gc - (dot / (Gpop_common.dot(Gpop_common) + eps)) * Gpop_common
+            else:
+                raise ValueError(f"[gpop] unknown sup_mode: {self.cfg.sup_mode}")
 
         st = {
             "gpop_policy": g_raw.new_tensor(1.0),
@@ -222,7 +315,10 @@ class GpopCommonGate:
         - always monitor (if cfg.monitor)
         - optionally apply policy (if policy==True or cfg.policy==True)
         """
-        stats = self.monitor(G=G, g_raw=g_raw, g_final=g_final, names=names)
+        if bool(self.cfg.monitor):
+            stats = self.monitor(G=G, g_raw=g_raw, g_final=g_final, names=names)
+        else:
+            stats = {}
 
         do_policy = bool(self.cfg.policy) if policy is None else bool(policy)
         if do_policy:

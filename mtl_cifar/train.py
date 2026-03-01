@@ -1,4 +1,26 @@
 import os, sys
+import argparse
+
+parser = argparse.ArgumentParser()
+parser.add_argument(
+    "--gpu",
+    "--gpu_id",
+    dest="gpu",
+    type=int,
+    default=0,
+    help="physical GPU id, e.g., 0/1/2/3",
+)
+parser.add_argument(
+    "--grad_mode",
+    type=str,
+    default="sum",
+    help="gradient aggregation mode",
+)
+args, _ = parser.parse_known_args()
+
+# Must be set before importing torch so that CUDA sees the correct visible devices.
+os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
+
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from logger import JSONLLogger, save_json
@@ -16,7 +38,6 @@ import torchvision.transforms as T
 from model import MTLNet
 
 from gradient_wrapper.grad_wrapper import GradAggregator, GradAggConfig
-
 
 # -------------------------
 # Utils
@@ -60,10 +81,10 @@ def to_jsonable(d):
 @dataclass
 class TrainCfg:
     seed: int = 0
-    device: str = "cuda"
+    device: str = "cuda:0"
     batch_size: int = 256
     epochs: int = 30
-    lr: float = 0.1
+    lr: float = 0.001
     wd: float = 5e-4
     num_workers: int = 4
 
@@ -73,21 +94,35 @@ class TrainCfg:
     w_rec: float = 1.0
 
     # grad-aggregation mode
-    grad_mode: str = "mgda"   # sum | pcgrad | graddrop | mgda | cagrad | dwa | gradnorm | uw_heuristic | nash_mtl
+    grad_mode: str = "sum"   # sum | pcgrad | graddrop | mgda | cagrad | dwa | gradnorm | uw_heuristic | nash_mtl
 
 
 def main(cfg: TrainCfg):
-    run_dir = os.path.join("runs_cifar", cfg.grad_mode)
+    run_name = f"{cfg.grad_mode}_{int(time.time())}"
+    run_dir = os.path.join("runs_cifar", run_name)
     os.makedirs(run_dir, exist_ok=True)
 
     train_log = JSONLLogger(os.path.join(run_dir, "train.jsonl"))
     eval_log  = JSONLLogger(os.path.join(run_dir, "eval.jsonl"))
 
-    # 保存 config（一次）
+    # Save config once at the beginning.
     save_json(os.path.join(run_dir, "config.json"), cfg.__dict__)
     
     set_seed(cfg.seed)
     device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
+
+    # Detailed CUDA debug information to verify which GPU is actually used.
+    print("[DEBUG] Parsed args.gpu:", args.gpu)
+    print("[DEBUG] CUDA_VISIBLE_DEVICES:", os.environ.get("CUDA_VISIBLE_DEVICES"))
+    print("[DEBUG] torch.cuda.is_available():", torch.cuda.is_available())
+    print("[DEBUG] torch.cuda.device_count():", torch.cuda.device_count())
+    if torch.cuda.is_available():
+        current_idx = torch.cuda.current_device()
+        current_name = torch.cuda.get_device_name(current_idx)
+        print("[DEBUG] torch.cuda.current_device():", current_idx)
+        print("[DEBUG] torch.cuda.get_device_name(current_idx):", current_name)
+        print("[DEBUG] cfg.device (logical):", cfg.device)
+        print("[DEBUG] torch.device used in code:", device)
 
     # dataset
     tr = T.Compose([
@@ -97,8 +132,8 @@ def main(cfg: TrainCfg):
     ])
     te = T.Compose([T.ToTensor()])
 
-    trainset = torchvision.datasets.CIFAR10(root="./data", train=True, download=True, transform=tr)
-    testset  = torchvision.datasets.CIFAR10(root="./data", train=False, download=True, transform=te)
+    trainset = torchvision.datasets.CIFAR10(root="./dataset", train=True, download=True, transform=tr)
+    testset  = torchvision.datasets.CIFAR10(root="./dataset", train=False, download=True, transform=te)
 
     train_loader = DataLoader(trainset, batch_size=cfg.batch_size, shuffle=True,
                               num_workers=cfg.num_workers, pin_memory=True)
@@ -113,7 +148,12 @@ def main(cfg: TrainCfg):
     #     return cfg.lr * 0.5 * (1.0 + math.cos(math.pi * ep / cfg.epochs))
 
     # your aggregator
-    agcfg = GradAggConfig(mode=cfg.grad_mode)
+    agcfg = GradAggConfig(
+        mode=cfg.grad_mode,
+        gpop_enabled=True,
+        gpop_monitor=True,
+        gpop_policy=False,
+    )
     def common_param_filter(n, p):
         return n.startswith("backbone.")
     agg = GradAggregator(model, agcfg, common_param_filter=common_param_filter, verbose=True)
@@ -188,7 +228,7 @@ def main(cfg: TrainCfg):
         # print(f"[eval] ep {ep:03d} acc_cls={acc:.4f} lr={lr_now:.5f}")
         print(f"[eval] ep {ep:03d} acc_cls={acc:.4f} lr={cfg.lr:.5f}")
         
-        # 记录 eval
+        # Record evaluation metrics.
         eval_log.write({
             "t": time.time() - t0,
             "epoch": ep,
@@ -228,8 +268,11 @@ if __name__ == "__main__":
         "sum", "pcgrad", "graddrop", "mgda", "cagrad", "dwa", "gradnorm", "uw_heuristic", "nash_mtl"
     ]
     cfg = TrainCfg(
+        # Inside this process, after setting CUDA_VISIBLE_DEVICES to args.gpu,
+        # the selected physical GPU is always exposed as logical "cuda:0".
+        device="cuda:0" if torch.cuda.is_available() else "cpu",
         epochs=30,
-        batch_size=8,
-        grad_mode=grad_modes[1],
+        batch_size=16,
+        grad_mode=args.grad_mode,
     )
     main(cfg)
