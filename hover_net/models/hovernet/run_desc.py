@@ -3,73 +3,139 @@ import matplotlib.pyplot as plt
 import torch
 import torch.nn.functional as F
 
+from collections import OrderedDict
+
 from misc.utils import center_pad_to_shape, cropping_center
 from .utils import crop_to_shape, dice_loss, mse_loss, msge_loss, xentropy_loss
 
-from collections import OrderedDict
+# ✅ add ShadowEMA
+from parameter_wrapper.shadow_model import ShadowEMA
 
-####
+
+# -------------------------
+# Shadow helpers
+# -------------------------
+def _shadow_group_fn(name: str) -> str:
+    """
+    Group function for ShadowEMA to split parameters into common/private.
+    """
+    name = name[7:] if name.startswith("module.") else name
+    return "private" if name.startswith("decoder.") else "common"
+
+
+def _ensure_shadow_ema_for_train(run_info, model):
+    """
+    TRAIN ONLY: create ShadowEMA if cfg provided.
+    Valid should NOT create a new one.
+    """
+    extra = run_info["net"]["extra_info"]
+    shadow_ema_cfg = extra.get("shadow_ema_cfg", None)
+    if shadow_ema_cfg is None:
+        return None
+
+    shadow_ema = run_info["net"].get("shadow_ema", None)
+    if shadow_ema is None:
+        shadow_ema = ShadowEMA(model, group_fn=_shadow_group_fn, **shadow_ema_cfg)
+        run_info["net"]["shadow_ema"] = shadow_ema
+    return shadow_ema
+
+
+def get_or_make_shadow_eval_fn(run_info, *, loss_opts, loss_func_dict):
+    extra = run_info["net"]["extra_info"]
+    fn = extra.get("_shadow_eval_fn_cached")
+    if fn is not None:
+        return fn
+
+    def eval_fn(m, *, imgs, true_dict, true_np_onehot):
+        was_training = bool(m.training)
+        m.eval()
+        with torch.no_grad():
+            pred = m(imgs)
+            pred = OrderedDict((k, v.permute(0,2,3,1).contiguous()) for k,v in pred.items())
+            pred["np"] = F.softmax(pred["np"], dim=-1)
+            if m.module.nr_types is not None and "tp" in pred:
+                pred["tp"] = F.softmax(pred["tp"], dim=-1)
+
+            loss_branch = {}
+            for branch_name in pred.keys():
+                L = 0.0
+                for loss_name, loss_weight in loss_opts[branch_name].items():
+                    loss_func = loss_func_dict[loss_name]
+                    loss_args = [true_dict[branch_name], pred[branch_name]]
+                    if loss_name == "msge":
+                        loss_args.append(true_np_onehot[..., 1])
+                    L = L + float(loss_weight) * loss_func(*loss_args)
+                loss_branch[branch_name] = L
+            total = sum(loss_branch.values())
+
+        if was_training:
+            m.train()
+
+        out = {"overall_loss": float(total.detach().item())}
+        for k, v in loss_branch.items():
+            out[f"{k}_loss"] = float(v.detach().item())
+        return out
+
+    extra["_shadow_eval_fn_cached"] = eval_fn
+    return eval_fn
+
+# -------------------------
+# Train
+# -------------------------
 def train_step(batch_data, run_info):
     """
-    One training step: forward, per-branch losses, GradAggregator.backward, optimizer step.
-    Records all scalar metrics from grad_agg.backward() into EMA for stats.json and tensorboard.
+    Original semantics unchanged.
+    Adds:
+      - ShadowEMA update AFTER optimizer.step()
+      - logs shadow_* stats into result_dict["EMA"]
     """
     run_info, state_info = run_info
+
     loss_func_dict = {
         "bce": xentropy_loss,
         "dice": dice_loss,
         "mse": mse_loss,
         "msge": msge_loss,
     }
-    # use 'ema' to add for EMA calculation, must be scalar!
+
     result_dict = {"EMA": {}}
     track_value = lambda name, value: result_dict["EMA"].update({name: value})
 
-    ####
     model = run_info["net"]["desc"]
     optimizer = run_info["net"]["optimizer"]
     grad_agg = run_info["net"]["grad_agg"]
-    ####
-    imgs = batch_data["img"]
-    true_np = batch_data["np_map"]
-    true_hv = batch_data["hv_map"]
 
-    imgs = imgs.to("cuda").type(torch.float32)  # to NCHW
-    imgs = imgs.permute(0, 3, 1, 2).contiguous()
+    # ✅ ShadowEMA: TRAIN creates/owns it
+    shadow_ema = _ensure_shadow_ema_for_train(run_info, model)
+    prev_raw_snap = prev_shadow_snap = None
+    if shadow_ema is not None:
+        prev_raw_snap = shadow_ema.snapshot_raw(model)
+        prev_shadow_snap = shadow_ema.snapshot_shadow()
 
-    # HWC
-    true_np = true_np.to("cuda").type(torch.int64)
-    true_hv = true_hv.to("cuda").type(torch.float32)
+    # ---- data to GPU (original)
+    imgs = batch_data["img"].to("cuda").type(torch.float32).permute(0, 3, 1, 2).contiguous()
+    true_np = batch_data["np_map"].to("cuda").type(torch.int64)
+    true_hv = batch_data["hv_map"].to("cuda").type(torch.float32)
 
-    true_np_onehot = (F.one_hot(true_np, num_classes=2)).type(torch.float32)
-    true_dict = {
-        "np": true_np_onehot,
-        "hv": true_hv,
-    }
+    true_np_onehot = F.one_hot(true_np, num_classes=2).type(torch.float32)
+    true_dict = {"np": true_np_onehot, "hv": true_hv}
 
     if model.module.nr_types is not None:
-        true_tp = batch_data["tp_map"]
-        true_tp = torch.squeeze(true_tp).to("cuda").type(torch.int64)
-        true_tp_onehot = F.one_hot(true_tp, num_classes=model.module.nr_types)
-        true_tp_onehot = true_tp_onehot.type(torch.float32)
+        true_tp = torch.squeeze(batch_data["tp_map"]).to("cuda").type(torch.int64)
+        true_tp_onehot = F.one_hot(true_tp, num_classes=model.module.nr_types).type(torch.float32)
         true_dict["tp"] = true_tp_onehot
 
-    ####
     model.train()
 
     pred_dict = model(imgs)
-    pred_dict = OrderedDict(
-        [[k, v.permute(0, 2, 3, 1).contiguous()] for k, v in pred_dict.items()]
-    )
+    pred_dict = OrderedDict((k, v.permute(0, 2, 3, 1).contiguous()) for k, v in pred_dict.items())
     pred_dict["np"] = F.softmax(pred_dict["np"], dim=-1)
-    if model.module.nr_types is not None:
+    if model.module.nr_types is not None and "tp" in pred_dict:
         pred_dict["tp"] = F.softmax(pred_dict["tp"], dim=-1)
 
-    ####
-    # loss = 0
+    # ---- loss (original)
     loss_branch = {}
     loss_opts = run_info["net"]["extra_info"]["loss"]
-
     for branch_name in pred_dict.keys():
         L = 0.0
         for loss_name, loss_weight in loss_opts[branch_name].items():
@@ -81,10 +147,8 @@ def train_step(batch_data, run_info):
             L = L + float(loss_weight) * term_loss
         loss_branch[branch_name] = L
 
-    # optional: log the true total weighted loss (same meaning as before)
     total_loss = sum(v for v in loss_branch.values())
 
-    # log per-branch losses as separate training metrics
     for branch_name, branch_loss in loss_branch.items():
         track_value(f"{branch_name}_loss", branch_loss.detach().item())
 
@@ -92,133 +156,156 @@ def train_step(batch_data, run_info):
     stats = grad_agg.backward(loss_branch, weights=None)
     optimizer.step()
 
+    # ✅ ShadowEMA update AFTER step
+    if shadow_ema is not None:
+        shadow_ema.update(model)
+
     track_value("overall_loss", total_loss.detach().item())
 
-    # Record all scalar metrics from the new GradAggregator wrapper (stats.json + tensorboard).
-    # Keys with "/" are sanitized to "_" for JSON/logging (e.g. g_t_norm/np -> grad_g_t_norm_np).
     for key, val in stats.items():
         if torch.is_tensor(val) and val.numel() == 1:
-            log_key = "grad_" + key.replace("/", "_")
-            track_value(log_key, val.detach().item())
+            track_value("grad_" + key.replace("/", "_"), val.detach().item())
         elif isinstance(val, (int, float)):
             track_value("grad_" + key.replace("/", "_"), float(val))
 
-    ####
+    # ✅ ShadowEMA stats (optional eval)
+    if shadow_ema is not None:
+        step = state_info.get("step", None)
+        eval_fn = get_or_make_shadow_eval_fn(
+            run_info, loss_opts=loss_opts, loss_func_dict=loss_func_dict
+        )
+        eval_every = run_info["net"]["extra_info"].get("shadow_eval_every", 1)
+        if eval_every < 1:
+            raise ValueError("shadow_eval_every must be >= 1")
+        shadow_stats = shadow_ema.on_step_end(
+            model,
+            prev_raw_snap=prev_raw_snap,
+            prev_shadow_snap=prev_shadow_snap,
+            do_gap=True,
+            do_raw_step=True,
+            do_shadow_step=True,
+            eval_fn=eval_fn,
+            eval_every=eval_every,
+            step=step,
+            eval_kwargs={"imgs": imgs, "true_dict": true_dict, "true_np_onehot": true_np_onehot}
+        )
 
-    # pick 2 random sample from the batch for visualization
+        for key, val in shadow_stats.items():
+            if isinstance(val, (int, float)):
+                track_value("train_shadow_" + key.replace("/", "_"), float(val))
+
+    # ---- visualization protocol (original)
     sample_indices = torch.randint(0, true_np.shape[0], (2,))
 
-    imgs = (imgs[sample_indices]).byte()  # to uint8
-    imgs = imgs.permute(0, 2, 3, 1).contiguous().cpu().numpy()
+    imgs_viz = imgs[sample_indices].byte().permute(0, 2, 3, 1).contiguous().cpu().numpy()
 
-    pred_dict["np"] = pred_dict["np"][..., 1:2]  # return pos only
-    pred_dict = {
-        k: v[sample_indices].detach().cpu().numpy() for k, v in pred_dict.items()
+    pred_dict_viz = dict(pred_dict)
+    pred_dict_viz["np"] = pred_dict_viz["np"][..., 1:2]  # pos only
+    pred_dict_viz = {k: v[sample_indices].detach().cpu().numpy() for k, v in pred_dict_viz.items()}
+
+    true_dict_viz = dict(true_dict)
+    true_dict_viz["np"] = true_np[..., None]
+    true_dict_viz = {k: v[sample_indices].detach().cpu().numpy() for k, v in true_dict_viz.items()}
+
+    result_dict["raw"] = {
+        "img": imgs_viz,
+        "np": (true_dict_viz["np"], pred_dict_viz["np"]),
+        "hv": (true_dict_viz["hv"], pred_dict_viz["hv"]),
     }
-
-    true_dict["np"] = true_np[..., None]
-    true_dict = {
-        k: v[sample_indices].detach().cpu().numpy() for k, v in true_dict.items()
-    }
-
-    # * Its up to user to define the protocol to process the raw output per step!
-    result_dict["raw"] = {  # protocol for contents exchange within `raw`
-        "img": imgs,
-        "np": (true_dict["np"], pred_dict["np"]),
-        "hv": (true_dict["hv"], pred_dict["hv"]),
-    }
-
     return result_dict
 
 
-####
+# -------------------------
+# Valid
+# -------------------------
 def valid_step(batch_data, run_info):
+    """
+    Original semantics unchanged.
+    Adds:
+      - optionally logs shadow_gap + eval/raw vs eval/shadow into result_dict["EMA"]
+    """
     run_info, state_info = run_info
-    ####
     model = run_info["net"]["desc"]
-    model.eval()  # infer mode
+    model.eval()
 
-    ####
     imgs = batch_data["img"]
-    true_np = batch_data["np_map"]
-    true_hv = batch_data["hv_map"]
+    true_np = batch_data["np_map"].type(torch.int64)
+    true_hv = batch_data["hv_map"].type(torch.float32)
 
-    imgs_gpu = imgs.to("cuda").type(torch.float32)  # to NCHW
-    imgs_gpu = imgs_gpu.permute(0, 3, 1, 2).contiguous()
+    imgs_gpu = imgs.to("cuda").type(torch.float32).permute(0, 3, 1, 2).contiguous()
 
-    # HWC
-    # Keep batch dimension to ensure consistent accumulation across steps
-    true_np = true_np.type(torch.int64)
-    true_hv = true_hv.type(torch.float32)
-
-    true_dict = {
-        "np": true_np,
-        "hv": true_hv,
-    }
-
-    if model.module.nr_types is not None:
-        true_tp = batch_data["tp_map"]
-        true_tp = true_tp.type(torch.int64)
-        true_dict["tp"] = true_tp
-
-    # --------------------------------------------------------------
-    with torch.no_grad():  # dont compute gradient
+    with torch.no_grad():
         pred_dict = model(imgs_gpu)
-        pred_dict = OrderedDict(
-            [[k, v.permute(0, 2, 3, 1).contiguous()] for k, v in pred_dict.items()]
-        )
+        pred_dict = OrderedDict((k, v.permute(0, 2, 3, 1).contiguous()) for k, v in pred_dict.items())
         pred_dict["np"] = F.softmax(pred_dict["np"], dim=-1)[..., 1]
-        if model.module.nr_types is not None:
+        if model.module.nr_types is not None and "tp" in pred_dict:
             type_map = F.softmax(pred_dict["tp"], dim=-1)
-            type_map = torch.argmax(type_map, dim=-1, keepdim=False)
-            type_map = type_map.type(torch.float32)
+            type_map = torch.argmax(type_map, dim=-1, keepdim=False).type(torch.float32)
             pred_dict["tp"] = type_map
 
-    # * Its up to user to define the protocol to process the raw output per step!
-    result_dict = {  # protocol for contents exchange within `raw`
+    result_dict = {
         "raw": {
             "imgs": imgs.numpy(),
-            "true_np": true_dict["np"].numpy(),
-            "true_hv": true_dict["hv"].numpy(),
+            "true_np": true_np.numpy(),
+            "true_hv": true_hv.numpy(),
             "prob_np": pred_dict["np"].cpu().numpy(),
             "pred_hv": pred_dict["hv"].cpu().numpy(),
-        }
+        },
+        "EMA": {},  # ✅ for shadow stats
     }
+    track_value = lambda name, value: result_dict["EMA"].update({name: value})
+
     if model.module.nr_types is not None:
-        result_dict["raw"]["true_tp"] = true_dict["tp"].numpy()
+        true_tp = batch_data["tp_map"].type(torch.int64)
+        result_dict["raw"]["true_tp"] = true_tp.numpy()
         result_dict["raw"]["pred_tp"] = pred_dict["tp"].cpu().numpy()
-    return result_dict
 
+    # ✅ reuse TRAIN shadow_ema only; do not create in valid
+    shadow_ema = run_info["net"].get("shadow_ema", None)
+    if shadow_ema is not None:
+        step = state_info.get("step", None)
+        true_np_cuda = true_np.to("cuda")
+        true_hv_cuda = true_hv.to("cuda")
+        true_np_onehot = F.one_hot(true_np_cuda, num_classes=2).type(torch.float32)
+        true_dict = {"np": true_np_onehot, "hv": true_hv_cuda}
+        if model.module.nr_types is not None:
+            true_tp_cuda = batch_data["tp_map"].to("cuda").type(torch.int64)
+            true_tp_onehot = F.one_hot(true_tp_cuda, num_classes=model.module.nr_types).type(torch.float32)
+            true_dict["tp"] = true_tp_onehot
 
-####
-def infer_step(batch_data, model):
+        loss_opts = run_info["net"]["extra_info"]["loss"]
+        loss_func_dict = {
+            "bce": xentropy_loss,
+            "dice": dice_loss,
+            "mse": mse_loss,
+            "msge": msge_loss,
+        }
 
-    ####
-    patch_imgs = batch_data
-
-    patch_imgs_gpu = patch_imgs.to("cuda").type(torch.float32)  # to NCHW
-    patch_imgs_gpu = patch_imgs_gpu.permute(0, 3, 1, 2).contiguous()
-
-    ####
-    model.eval()  # infer mode
-
-    # --------------------------------------------------------------
-    with torch.no_grad():  # dont compute gradient
-        pred_dict = model(patch_imgs_gpu)
-        pred_dict = OrderedDict(
-            [[k, v.permute(0, 2, 3, 1).contiguous()] for k, v in pred_dict.items()]
+        eval_fn = get_or_make_shadow_eval_fn(
+            run_info, loss_opts=loss_opts, loss_func_dict=loss_func_dict
         )
-        pred_dict["np"] = F.softmax(pred_dict["np"], dim=-1)[..., 1:]
-        if "tp" in pred_dict:
-            type_map = F.softmax(pred_dict["tp"], dim=-1)
-            type_map = torch.argmax(type_map, dim=-1, keepdim=True)
-            type_map = type_map.type(torch.float32)
-            pred_dict["tp"] = type_map
-        pred_output = torch.cat(list(pred_dict.values()), -1)
+        eval_every = run_info["net"]["extra_info"].get("shadow_eval_every", 1)
+        if eval_every < 1:
+            raise ValueError("shadow_eval_every must be >= 1")
 
-    # * Its up to user to define the protocol to process the raw output per step!
-    return pred_output.cpu().numpy()
+        shadow_stats = shadow_ema.on_step_end(
+            model,
+            prev_raw_snap=None,
+            prev_shadow_snap=None,
+            do_gap=True,
+            do_raw_step=False,
+            do_shadow_step=False,
+            eval_fn=eval_fn,
+            eval_every=eval_every,
+            step=step,
+            eval_kwargs={"imgs": imgs_gpu, "true_dict": true_dict, "true_np_onehot": true_np_onehot}
+        )
 
+        for key, val in shadow_stats.items():
+            if isinstance(val, (int, float)):
+                track_value("valid_shadow_" + key.replace("/", "_"), float(val))
+
+    return result_dict
 
 ####
 def viz_step_output(raw_data, nr_types=None):
@@ -278,11 +365,7 @@ def viz_step_output(raw_data, nr_types=None):
     viz_list = np.concatenate(viz_list, axis=0)
     return viz_list
 
-
 ####
-from itertools import chain
-
-
 def proc_valid_step_output(raw_data, nr_types=None):
     # TODO: add auto populate from main state track list
     track_dict = {"scalar": {}, "image": {}}

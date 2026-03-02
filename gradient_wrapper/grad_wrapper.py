@@ -54,6 +54,17 @@ def gradvec(loss: torch.Tensor, params: List[torch.nn.Parameter], retain_graph: 
     grads = safe_grads(grads, params)
     return flatten(grads)
 
+def _to_tensor_dict(stats: Dict[str, torch.Tensor], device, dtype=None) -> Dict[str, torch.Tensor]:
+    out = {}
+    for k, v in stats.items():
+        if torch.is_tensor(v):
+            out[k] = v.detach()
+        else:
+            out[k] = torch.tensor(v, device=device, dtype=dtype)
+    return out
+
+def _prefix_t(stats: Dict[str, torch.Tensor], prefix: str) -> Dict[str, torch.Tensor]:
+    return {f"{prefix}.{k}": v for k, v in stats.items()}
 
 @dataclass
 class GradAggConfig:
@@ -83,8 +94,8 @@ class GradAggConfig:
     uw_beta: float = 0.9
     
     # ---- Gpop common gate (optional) ----
-    gpop_enabled: bool = True
-    gpop_monitor: bool = True
+    gpop_enabled: bool = False
+    gpop_monitor: bool = False
     gpop_policy: bool = False
     gpop_beta: float = 0.99
     gpop_rho_thr: float = 0.0
@@ -206,34 +217,10 @@ class GradAggregator:
             "dwa": 10, "gradnorm": 11, "uw_heuristic": 12,
             "nash_mtl": 20,
         }
-        stats: Dict[str, torch.Tensor] = {"mode_id": torch.tensor(MODE2ID.get(mode, -1), device=device)}
-        # ===== conflict geometry logs (raw, before aggregation) =====
-        with torch.no_grad():
-            # per-task norms
-            g_t_norm = G.norm(dim=1) + eps  # [T]
+        stats: Dict[str, torch.Tensor] = {
+            "mode_id": torch.tensor(MODE2ID.get(mode, -1), device=device)
+        }
 
-            # pairwise cosine among task grads
-            G_unit = G / g_t_norm[:, None]  # [T,P]
-            cos_tt = G_unit @ G_unit.T      # [T,T]
-            triu = torch.triu(torch.ones_like(cos_tt, dtype=torch.bool), diagonal=1)
-            cos_vals = cos_tt[triu]
-            stats_geom = {
-                "cos_tt_mean": cos_vals.mean() if cos_vals.numel() else cos_tt.new_tensor(0.0),
-                "cos_tt_min":  cos_vals.min()  if cos_vals.numel() else cos_tt.new_tensor(0.0),
-                "cos_tt_neg_frac": (cos_vals < 0).float().mean() if cos_vals.numel() else cos_tt.new_tensor(0.0),
-            }
-
-            # raw violation: whether raw summed gradient hurts a task (1st-order)
-            dot_t_raw = (G @ g_raw)  # [T]
-            raw_viol_frac = (dot_t_raw < 0).float().mean()
-
-            stats_geom.update({
-                "raw_viol_frac": raw_viol_frac,
-                "dot_raw_min": dot_t_raw.min(),
-                "dot_raw_mean": dot_t_raw.mean(),
-            })
-            
-        stats.update(stats_geom)
         with torch.no_grad():
             self.overall_loss_raw = sum(losses[k].detach() * float(weights.get(k, 1.0)) for k in names)
 
@@ -274,7 +261,7 @@ class GradAggregator:
             w_task, st = dwa_weights(losses_vec, prev_losses_vec=prev, Ttemp=self.cfg.dwa_T, eps=eps)
             g_final = apply_weighting_then_sum(G, w_task)  # ignores external weights by design
             stats.update(st)
-            stats.update({"w_task_max": w_task.max(), "w_task_min": w_task.min()})
+            stats.update({"b.w.max": w_task.max(), "b.w.min": w_task.min()})
 
         elif mode == "gradnorm":
             if self._init_losses is None:
@@ -307,29 +294,9 @@ class GradAggregator:
             raise ValueError(f"Unknown mode: {self.cfg.mode}")
         
         if self.gpop is not None:
-            stats.update(self.gpop.monitor(G=G, g_raw=g_raw, g_final=g_final, names=names))
+            g_final, st_gpop = self.gpop.apply(G=G, g_raw=g_raw, g_final=g_final, names=names)
+            stats.update(st_gpop)
 
-        # ===== conflict logs (final, after aggregation) =====
-        with torch.no_grad():
-            dot_t_final = (G @ g_final)  # [T]
-            viol_frac = (dot_t_final < 0).float().mean()
-
-            # normalized projection strength (helps see which task is sacrificed)
-            g_t_norm = G.norm(dim=1) + eps
-            proj_strength = dot_t_final / g_t_norm  # [T]
-
-            stats.update({
-                "viol_frac": viol_frac,
-                "dot_final_min": dot_t_final.min(),
-                "dot_final_mean": dot_t_final.mean(),
-            })
-
-            # per-task logs with stable keys
-            for i, k in enumerate(names):
-                stats[f"g_t_norm/{k}"] = g_t_norm[i]
-                stats[f"dot_final/{k}"] = dot_t_final[i]
-                stats[f"proj_final_over_norm/{k}"] = proj_strength[i]
-                
         # -------------------- write back grads --------------------
         grads_final = unflatten(g_final.detach(), self.params)
         for p, g in zip(self.params, grads_final):

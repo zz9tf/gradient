@@ -52,8 +52,11 @@ def get_config(nr_type, mode):
                             },
                             "grad_mode": "sum",
                             "grad_cfg": {},
-                            "grad_gpop_key": "np",
-                            "grad_gpop_use_weight": True,
+                            "shadow_ema_cfg": {
+                                "include_buffers": False,
+                                "beta": 0.999,
+                                "eps": 1e-8,
+                            },
                         },
                         # path to load, -1 to auto load checkpoint from previous phase,
                         # None to start from scratch

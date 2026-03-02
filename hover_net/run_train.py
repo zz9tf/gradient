@@ -385,25 +385,20 @@ class TrainManager(Config):
             extra_info = dict(net_info["extra_info"])
             grad_mode = self.grad_overrides.get("mode", extra_info["grad_mode"])
             # start from config grad_cfg and apply any CLI overrides except mode
-            grad_cfg = dict(extra_info.get("grad_cfg", {}))
-            grad_cfg["gpop_enabled"] = True
-            for k, v in self.grad_overrides.items():
-                if k == "mode":
-                    continue
-                grad_cfg[k] = v
+            grad_cfg = {
+                **extra_info.get("grad_cfg", {}),
+                **self.grad_overrides,
+            }
+            
             # Store effective config so logs/checkpoints record what is actually used
             extra_info["grad_mode"] = grad_mode
             extra_info["grad_cfg"] = grad_cfg
-            # def keeper(name, p):
-            #     name = name[7:] if name.startswith("module.") else name
-            #     return not name.startswith("decoder.")
             def common_param_filter(name, p):
                 name = name[7:] if name.startswith("module.") else name
                 return not name.startswith("decoder.")
             grad_agg = GradAggregator(
                 net_desc,
-                GradAggConfig(mode=grad_mode, **grad_cfg),
-                # param_filter=keeper,
+                GradAggConfig(**grad_cfg),
                 common_param_filter=common_param_filter,
                 verbose=True,
             )
