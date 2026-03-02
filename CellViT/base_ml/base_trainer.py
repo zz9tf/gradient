@@ -13,6 +13,7 @@ import torch
 import torch.nn as nn
 import wandb
 from base_ml.base_early_stopping import EarlyStopping
+from base_ml.stats_json_writer import StatsJsonWriter
 from pathlib import Path
 from torch.nn.modules.loss import _Loss
 from torch.optim import Optimizer
@@ -168,8 +169,10 @@ class BaseTrainer:
         """
 
         self.logger.info(f"Starting training, total number of epochs: {epochs}")
+        stats_writer = StatsJsonWriter(self.logdir / "stats.json")
         if metric_init is not None and self.start_epoch == 0:
             wandb.log(metric_init, step=0)
+            stats_writer.update_step(0, metric_init)
         for epoch in range(self.start_epoch, epochs):
             # training epoch
             self.logger.info(f"Epoch: {epoch+1}/{epochs}")
@@ -177,6 +180,7 @@ class BaseTrainer:
                 epoch, train_dataloader, **kwargs
             )
             wandb.log(train_scalar_metrics, step=epoch + 1)
+            stats_writer.update_step(epoch + 1, train_scalar_metrics)
             if self.log_images:
                 wandb.log(train_image_metrics, step=epoch + 1)
             if ((epoch + 1) % eval_every) == 0:
@@ -187,6 +191,7 @@ class BaseTrainer:
                     early_stopping_metric,
                 ) = self.validation_epoch(epoch, val_dataloader)
                 wandb.log(val_scalar_metrics, step=epoch + 1)
+                stats_writer.update_step(epoch + 1, val_scalar_metrics)
                 if self.log_images:
                     wandb.log(val_image_metrics, step=epoch + 1)
 
@@ -198,6 +203,7 @@ class BaseTrainer:
                 },
                 step=epoch + 1,
             )
+            stats_writer.update_step(epoch + 1, {"Learning-Rate/Learning-Rate": curr_lr})
             if (epoch + 1) % eval_every == 0:
                 # early stopping
                 if self.early_stopping is not None:
