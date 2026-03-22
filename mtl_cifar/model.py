@@ -3,7 +3,6 @@ import torch.nn.functional as F
 
 # Tiny ResNet for CIFAR (ResNet-14-ish)
 # -------------------------
-
 class BasicBlock(nn.Module):
     def __init__(self, in_ch, out_ch, stride=1):
         super().__init__()

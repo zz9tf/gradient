@@ -358,7 +358,7 @@ def dump_summary(hub: TrainStatsHub, outpath: str):
 # -------------------------
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("input", type=str, help="train.jsonl")
+    ap.add_argument("--input", type=str, required=True, help="train.jsonl")
     ap.add_argument("--outdir", type=str, default=None)
     ap.add_argument("--smooth", type=int, default=100)
     ap.add_argument("--policy", type=str, default="cov_inv")

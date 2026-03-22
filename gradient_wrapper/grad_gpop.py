@@ -330,7 +330,7 @@ class CommonGpopSurgery:
         # ---- Write back per-task grads (NOT merged) ----
         G_new = G_work.clone()
         G_new[:, cmask] = G_common_new
-        new_g_merged_common = self._merge_from_G(G_new)
+        new_g_merged_common = self._merge_from_G(G_new)[cmask] # [Pc]
         self._ema_update(new_g_merged_common)
 
         st = _to_tdict(
